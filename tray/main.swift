@@ -11,8 +11,8 @@
 
 import AppKit
 
-let bridgeLabel = "com.twick.herdr-bridge"
-let bridgePlist = NSString(string: "~/Library/LaunchAgents/com.twick.herdr-bridge.plist")
+let bridgeLabel = "dev.planeshift.herdr-bridge"
+let bridgePlist = NSString(string: "~/Library/LaunchAgents/dev.planeshift.herdr-bridge.plist")
     .expandingTildeInPath
 let microdSocket = NSString(string: "~/.cache/microd/microd.sock").expandingTildeInPath
 let uid = getuid()

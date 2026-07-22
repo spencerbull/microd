@@ -103,9 +103,9 @@ cargo run -p herdr-bridge
 
 Three LaunchAgents (in `~/Library/LaunchAgents/`):
 
-- `com.twick.microd` — always on; waits for the pad to appear, survives unplug/replug
-- `com.twick.herdr-bridge` — loaded/unloaded by the tray to switch pad ownership
-- `com.twick.micro-tray` — menu bar switch (`tray/`, single-file Swift app)
+- `dev.planeshift.microd` — always on; waits for the pad to appear, survives unplug/replug
+- `dev.planeshift.herdr-bridge` — loaded/unloaded by the tray to switch pad ownership
+- `dev.planeshift.micro-tray` — menu bar switch (`tray/`, single-file Swift app)
 
 The tray icon shows the pad's owner (`⌨H` = herdr, `⌨C` = Codex). Modes:
 **Auto** (default — Codex owns the pad while the ChatGPT app is running, herdr
@@ -116,9 +116,9 @@ bridge and clears the Agent Key lights; microd keeps running in every mode
 ```bash
 ./scripts/build.sh   # release build + codesign microd with the `microd-dev`
                      # identity so Input Monitoring approval survives rebuilds
-launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.twick.microd.plist
-launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.twick.micro-tray.plist
-# the tray manages com.twick.herdr-bridge itself
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/dev.planeshift.microd.plist
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/dev.planeshift.micro-tray.plist
+# the tray manages dev.planeshift.herdr-bridge itself
 ```
 
 Both daemons run with `ProcessType Background` + `Nice 5`, block on I/O when
