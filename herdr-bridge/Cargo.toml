@@ -1,0 +1,10 @@
+[package]
+name = "herdr-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Maps Codex Micro pad events (via microd) onto herdr agents, panes, and workspaces"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"

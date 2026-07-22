@@ -1,0 +1,16 @@
+[package]
+name = "microd"
+version = "0.1.0"
+edition = "2021"
+description = "Companion daemon and CLI for the Codex Micro macropad: pad events, gestures, and RGB control over a Unix socket"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/PlaneshiftDev/microd"
+keywords = ["macropad", "hid", "codex-micro", "worklouder", "daemon"]
+categories = ["hardware-support", "command-line-utilities"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hidapi = { version = "2", features = ["macos-shared-device"] }
+serde_json = "1"

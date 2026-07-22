@@ -1,0 +1,3 @@
+[workspace]
+members = ["microd", "herdr-bridge"]
+resolver = "2"
