@@ -87,10 +87,19 @@ The six Agent Keys mirror up to six herdr agents:
 The outer ambient ring summarizes the most important state across all six
 agents: red error, then amber blocked/approval, then green ready for review,
 then blue working, otherwise off. A working agent that returns to Herdr's
-`idle` state is latched green until its Agent Key is pressed, because current
-Codex detection does not expose a persistent `done` state. Dictation
+`idle` state is latched green until its Agent Key is pressed or a new pane
+focus transition selects it from a Herdr client, because current screen-based
+Codex, Claude, and Devin detection does not expose a persistent `done` state.
+The pane merely remaining selected while Herdr is behind another app does not
+acknowledge the alert. An authoritative `blocked`, `working`, or error state
+always overrides that latch. Dictation
 temporarily overrides the ring with teal while recording and white while
 Voxtype is processing, then restores the aggregate agent state.
+
+Herdr currently derives these providers' statuses from terminal output. The
+bridge therefore treats only Herdr's explicit `blocked` status as waiting for
+user input; it does not guess from punctuation or generic question marks.
+Provider-native input-request hooks need a separate, explicit event contract.
 
 Controls:
 
@@ -102,21 +111,23 @@ Controls:
 | `ACT06` | send `enter` to the focused pane (approve) |
 | `ACT07` | send `esc` to the focused pane (deny/interrupt) |
 | `ACT08` | jump to the next **blocked** agent |
-| mic key `ACT10` | Omarchy/Voxtype push-to-talk (`record start` on press, `record stop` on release) |
+| mic key `ACT10` | optional Omarchy/Voxtype push-to-talk with `--voxtype`; otherwise unmapped |
 | Enter key `ACT11` | send `enter` to the focused pane |
 | joystick left/right | previous/next tab in the focused workspace |
 | joystick up/down | previous/next workspace |
 
 The microphone key uses the computer's microphone; the Codex Micro itself
 only sends press/release events. On Omarchy, install and enable Dictation
-(Voxtype) first. The user service records ownership in its private state
+(Voxtype) first, then start the bridge with `--voxtype`. The user service
+records ownership in its private state
 directory before starting capture and runs an ownership-aware
 `voxtype record stop` on normal exit, crash restart, or forced termination,
 without stopping a recording it did not start.
 
 ```bash
 cargo run -p microd -- run &     # start the daemon first
-cargo run -p herdr-bridge
+cargo run -p herdr-bridge                  # portable default
+cargo run -p herdr-bridge -- --voxtype    # optional Omarchy dictation
 ```
 
 ## Linux (Bluetooth or USB)
@@ -172,6 +183,17 @@ and restarts after a Bluetooth or Herdr disconnect. On Hyprland it also uses
 the compositor's supported focus dispatcher to bring the terminal window
 titled `herdr` to the foreground after pane, tab, or workspace navigation.
 Logs are available with `journalctl --user -u microd -u herdr-bridge`.
+
+The packaged unit leaves Voxtype disabled so it also works on Linux systems
+without Omarchy Dictation. Enable the optional microphone mapping with a user
+override:
+
+```ini
+# systemctl --user edit herdr-bridge.service
+[Service]
+ExecStart=
+ExecStart=%h/.local/bin/herdr-bridge --voxtype
+```
 
 Linux ownership is an explicit two-mode switch because the vendor channel has
 no multi-writer arbitration:
