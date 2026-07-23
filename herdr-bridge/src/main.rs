@@ -1623,6 +1623,7 @@ mod tests {
         ] {
             let path = socket_path("subscribe");
             let listener = UnixListener::bind(&path).unwrap();
+            let (release_tx, release_rx) = mpsc::channel();
             let server = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = String::new();
@@ -1634,8 +1635,10 @@ mod tests {
                     "events.subscribe"
                 );
                 send_line(&mut stream, &ack).unwrap();
+                release_rx.recv().unwrap();
             });
             let result = subscribe(&path, &BTreeSet::new());
+            release_tx.send(()).unwrap();
             assert_eq!(result.is_ok(), accepted);
             server.join().unwrap();
             fs::remove_file(path).unwrap();
@@ -1792,7 +1795,7 @@ mod tests {
     #[test]
     fn hyprland_subprocess_is_killed_at_the_shared_deadline() {
         let started = Instant::now();
-        let mut command = Command::new("/usr/bin/sleep");
+        let mut command = Command::new("sleep");
         command.arg("1");
 
         let error = run_bounded_command(command, started + Duration::from_millis(25)).unwrap_err();
