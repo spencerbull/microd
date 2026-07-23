@@ -1,0 +1,28 @@
+[Unit]
+Description=Codex Micro integration for Herdr
+Documentation=https://github.com/PlaneshiftDev/microd
+Requires=microd.service
+After=microd.service
+
+[Service]
+Type=simple
+ExecStartPre=-%h/.local/bin/herdr-bridge --cleanup-dictation
+ExecStart=%h/.local/bin/herdr-bridge
+ExecStopPost=-%h/.local/bin/herdr-bridge --cleanup-dictation
+Restart=on-failure
+RestartSec=2s
+Environment=MICROD_SOCKET=%t/microd/microd.sock
+StateDirectory=herdr-bridge
+StateDirectoryMode=0700
+UMask=0077
+Nice=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=default.target

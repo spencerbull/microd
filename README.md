@@ -11,8 +11,9 @@ Codex Micro  <-- vendor HID -->  microd  <-- unix socket -->  herdr-bridge  <-- 
 
 Owns the pad's vendor HID channel (the one the ChatGPT desktop app uses for
 Agent Key status lights) and serves newline-delimited JSON on a Unix socket
-(`$MICROD_SOCKET` or `~/.cache/microd/microd.sock`). Any app can connect;
-events are broadcast to all clients.
+(`$MICROD_SOCKET`, `$XDG_RUNTIME_DIR/microd/microd.sock` on Linux, or
+`~/.cache/microd/microd.sock` as a fallback). Any app can connect; events are
+broadcast to all clients.
 
 Events out:
 
@@ -48,12 +49,14 @@ Commands in (one per line, `id` echoed back as `{"id":...,"ok":true|false}`):
 
 ```json
 {"id":1,"cmd":"lights","lights":[{"slot":0,"color":65280,"effect":"breath","speed":50}]}
-{"id":2,"cmd":"clear"}
-{"id":3,"cmd":"raw","method":"device.status","params":{}}
-{"id":4,"cmd":"gesture_config","long_press_ms":450,"double_tap_ms":250,"double_tap_keys":["AG00","AG01"]}
+{"id":2,"cmd":"lighting_config","ambient":{"effect":"solid","brightness":1.0,"speed":0.0,"magic":0.0,"color":65280},"keys":{"effect":"off","brightness":0.0,"speed":0.0,"magic":0.0,"color":0}}
+{"id":3,"cmd":"clear"}
+{"id":4,"cmd":"raw","method":"device.status","params":{}}
+{"id":5,"cmd":"gesture_config","long_press_ms":450,"double_tap_ms":250,"double_tap_keys":["AG00","AG01"]}
 ```
 
-Effects: `off`, `solid`, `flash`, `flash2`, `breath`. Colors are 24-bit RGB ints.
+Effects follow Work Louder's SDK: `off`, `solid`, `snake`, `rainbow`,
+`breath`, `gradient`, and `shallow_breath`. Colors are 24-bit RGB ints.
 
 ```bash
 cargo run -p microd -- run       # the daemon
@@ -81,23 +84,84 @@ The six Agent Keys mirror up to six herdr agents:
 | unknown | dim purple |
 | no agent | off |
 
+The outer ambient ring summarizes the most important state across all six
+agents: red error, then amber blocked/approval, then green ready for review,
+then blue working, otherwise off. A working agent that returns to Herdr's
+`idle` state is latched green until its Agent Key is pressed, because current
+Codex detection does not expose a persistent `done` state. Dictation
+temporarily overrides the ring with teal while recording and white while
+Voxtype is processing, then restores the aggregate agent state.
+
 Controls:
 
 | control | action |
 |---|---|
-| Agent Key `AG00`–`AG05` | focus that agent's pane; empty slot falls back to focusing workspace N |
+| Agent Key `AG00`–`AG05` | focus the Herdr window and that agent's pane; empty slot falls back to workspace N |
 | dial rotate | cycle focus across live agents |
 | dial click | zoom toggle on the focused pane |
 | `ACT06` | send `enter` to the focused pane (approve) |
 | `ACT07` | send `esc` to the focused pane (deny/interrupt) |
 | `ACT08` | jump to the next **blocked** agent |
+| mic key `ACT10` | Omarchy/Voxtype push-to-talk (`record start` on press, `record stop` on release) |
+| Enter key `ACT11` | send `enter` to the focused pane |
 | joystick left/right | previous/next tab in the focused workspace |
 | joystick up/down | previous/next workspace |
+
+The microphone key uses the computer's microphone; the Codex Micro itself
+only sends press/release events. On Omarchy, install and enable Dictation
+(Voxtype) first. The user service records ownership in its private state
+directory before starting capture and runs an ownership-aware
+`voxtype record stop` on normal exit, crash restart, or forced termination,
+without stopping a recording it did not start.
 
 ```bash
 cargo run -p microd -- run &     # start the daemon first
 cargo run -p herdr-bridge
 ```
+
+## Linux (Bluetooth or USB)
+
+Linux exposes the Codex Micro vendor collection through `hidraw`. Grant the
+logged-in user's `input` group access to the exact device on both Bluetooth
+(`0005`) and USB (`0003`) transports:
+
+```udev
+# /etc/udev/rules.d/99-codex-micro.rules
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", KERNELS=="000[35]:303A:8360.*", GROUP="input", MODE="0660", TAG+="uaccess"
+```
+
+After reloading udev rules and reconnecting the pad, build and install the
+binaries and user units:
+
+```bash
+cargo build --release --workspace
+install -Dm755 target/release/microd ~/.local/bin/microd
+install -Dm755 target/release/herdr-bridge ~/.local/bin/herdr-bridge
+install -Dm644 systemd/microd.service ~/.config/systemd/user/microd.service
+install -Dm644 systemd/herdr-bridge.service ~/.config/systemd/user/herdr-bridge.service
+systemctl --user daemon-reload
+systemctl --user enable --now herdr-bridge.service
+```
+
+The bridge pulls in `microd.service`, waits for Herdr's default session socket,
+and restarts after a Bluetooth or Herdr disconnect. On Hyprland it also uses
+the compositor's supported focus dispatcher to bring the terminal window
+titled `herdr` to the foreground after pane, tab, or workspace navigation.
+Logs are available with `journalctl --user -u microd -u herdr-bridge`.
+
+Linux ownership is an explicit two-mode switch because the vendor channel has
+no multi-writer arbitration:
+
+```bash
+# Release the device before opening ChatGPT's Codex Micro integration:
+systemctl --user stop microd.service
+
+# Return exclusive ownership to Herdr (also starts microd):
+systemctl --user start herdr-bridge.service
+```
+
+If ChatGPT should own the pad after every login, disable both units instead of
+leaving the Herdr pair enabled.
 
 ## Running it (launchd + tray)
 
@@ -147,8 +211,11 @@ with corrections found by probing the real device:
 - `v.oai.thstatus` params: array of `{"id":0-5,"c":<24-bit RGB int>,"b":<0-100>,
   "e":<effect int>,"s":<0-100>}`. **Values must be integers** — the float/string
   forms in the emulator docs are ACKed but not rendered.
-- Effect enum: `0`=off, `1`=solid, `3`/`4`=flash variants, `6`=breath
-  (2 and 5 render nothing; brightness `b` appears to be ignored).
+- Official SDK effect enum: `0`=off, `1`=solid, `2`=snake, `3`=rainbow,
+  `4`=breath, `5`=gradient, `6`=shallow breath. Earlier probing correctly
+  observed the visuals but misnamed code 3 as a flash effect.
+- `v.oai.rgbcfg` independently controls the outer `ambient` ring and global
+  `keys` zone. Both compact side objects contain `e`, `b`, `s`, `m`, and `c`.
 - Device→host events use compact keys `{"m":"v.oai.hid","p":{...}}` (not
   `method`/`params`): keys `AG00`–`AG05`, `ACT06`–`ACT12`, `act` 1/0=press/release,
   2=encoder step (`ENC_CW`/`ENC_CC`, click=`ENC_CLK`); joystick =
@@ -174,3 +241,12 @@ with corrections found by probing the real device:
 The vendor protocol is private OpenAI/Work Louder behavior and can change with
 firmware or ChatGPT app updates. The channel is effectively single-owner: run
 microd or the ChatGPT desktop app's integration, not both.
+
+On firmware v0.4.1 over Bluetooth, low-deflection joystick reports can be
+continuous and the firmware can occasionally merge an input report into a
+multi-report response. microd preserves cleanly framed interleaving, discards
+irrecoverably malformed combined JSON, and retries only known idempotent
+status/version/light operations. Arbitrary raw commands are never retried.
+A one-shot input report that collides with a malformed firmware response can
+still be lost; USB-C is the strict-reliability transport until firmware fixes
+that Bluetooth race.

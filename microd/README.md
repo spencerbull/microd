@@ -57,13 +57,15 @@ Commands (one JSON object per line; `id` echoed back):
 
 ```json
 {"id":1,"cmd":"lights","lights":[{"slot":0,"color":65280,"effect":"breath","speed":50}]}
-{"id":2,"cmd":"clear"}
-{"id":3,"cmd":"raw","method":"device.status","params":{}}
-{"id":4,"cmd":"gesture_config","long_press_ms":450,"double_tap_ms":250,"double_tap_keys":["AG00"]}
+{"id":2,"cmd":"lighting_config","ambient":{"effect":"solid","brightness":1.0,"speed":0.0,"magic":0.0,"color":65280},"keys":{"effect":"off","brightness":0.0,"speed":0.0,"magic":0.0,"color":0}}
+{"id":3,"cmd":"clear"}
+{"id":4,"cmd":"raw","method":"device.status","params":{}}
+{"id":5,"cmd":"gesture_config","long_press_ms":450,"double_tap_ms":250,"double_tap_keys":["AG00"]}
 ```
 
-Effects: `off`, `solid`, `flash`, `flash2`, `breath`. Colors are 24-bit RGB
-integers. Gesture config is in-memory — re-send it after reconnecting.
+Effects: `off`, `solid`, `snake`, `rainbow`, `breath`, `gradient`, and
+`shallow_breath`. Unknown names are rejected. Colors are 24-bit RGB integers.
+Gesture config is in-memory — re-send it after reconnecting.
 
 ## macOS notes
 

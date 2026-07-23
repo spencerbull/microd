@@ -25,7 +25,7 @@ struct Cli {
 enum Command {
     /// Run the daemon: dispatch pad events / accept light commands on a socket
     Run {
-        /// Socket path (default: $MICROD_SOCKET or ~/.cache/microd/microd.sock)
+        /// Socket path (default: $MICROD_SOCKET, then $XDG_RUNTIME_DIR/microd/microd.sock)
         #[arg(long)]
         socket: Option<std::path::PathBuf>,
     },
@@ -39,7 +39,7 @@ enum Command {
     Light {
         slot: u8,
         color: String,
-        /// Effect: off | solid | flash | flash2 | breath
+        /// Effect: off | solid | snake | rainbow | breath | gradient | shallow-breath
         #[arg(long, default_value = "solid")]
         effect: Effect,
         /// Effect speed 0-100
@@ -70,20 +70,37 @@ fn main() -> Result<()> {
             server::run(&mut api, path)
         }
         Command::List => device::list(&api),
-        Command::Version => device::request(&device::open_vendor_interface(&api)?, "sys.version", None),
-        Command::Status => device::request(&device::open_vendor_interface(&api)?, "device.status", None),
-        Command::Light { slot, color, effect, speed } => {
+        Command::Version => {
+            device::request(&device::open_vendor_interface(&api)?, "sys.version", None)
+        }
+        Command::Status => {
+            device::request(&device::open_vendor_interface(&api)?, "device.status", None)
+        }
+        Command::Light {
+            slot,
+            color,
+            effect,
+            speed,
+        } => {
             if slot > 5 {
                 bail!("slot must be 0-5");
             }
             let color = u32::from_str_radix(color.trim_start_matches('#'), 16)
                 .context("color must be RRGGBB hex")?;
             let params = json!([device::light_param(slot, color, effect.code(), speed)]);
-            device::request(&device::open_vendor_interface(&api)?, "v.oai.thstatus", Some(params))
+            device::request(
+                &device::open_vendor_interface(&api)?,
+                "v.oai.thstatus",
+                Some(params),
+            )
         }
         Command::Clear => {
             let params: Value = (0..6).map(|id| device::light_param(id, 0, 0, 50)).collect();
-            device::request(&device::open_vendor_interface(&api)?, "v.oai.thstatus", Some(params))
+            device::request(
+                &device::open_vendor_interface(&api)?,
+                "v.oai.thstatus",
+                Some(params),
+            )
         }
         Command::Demo => demo(&device::open_vendor_interface(&api)?),
         Command::Watch => watch(&device::open_vendor_interface(&api)?),
@@ -104,15 +121,25 @@ fn demo(dev: &hidapi::HidDevice) -> Result<()> {
         let params: Value = (0..6u8)
             .map(|slot| {
                 let c = colors[(slot as usize + step) % colors.len()];
-                let effect = if step % 2 == 0 { Effect::Breath } else { Effect::Solid };
+                let effect = if step % 2 == 0 {
+                    Effect::Breath
+                } else {
+                    Effect::Solid
+                };
                 device::light_param(slot, c, effect.code(), 50)
             })
             .collect();
-        device::send_json(dev, &json!({"method": "v.oai.thstatus", "params": params, "id": step + 10}))?;
+        device::send_json(
+            dev,
+            &json!({"method": "v.oai.thstatus", "params": params, "id": step + 10}),
+        )?;
         std::thread::sleep(Duration::from_millis(700));
     }
     let params: Value = (0..6).map(|id| device::light_param(id, 0, 0, 50)).collect();
-    device::send_json(dev, &json!({"method": "v.oai.thstatus", "params": params, "id": 99}))?;
+    device::send_json(
+        dev,
+        &json!({"method": "v.oai.thstatus", "params": params, "id": 99}),
+    )?;
     println!("demo done, lights cleared");
     Ok(())
 }
