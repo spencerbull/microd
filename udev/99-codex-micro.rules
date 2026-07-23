@@ -1,0 +1,3 @@
+# Work Louder / OpenAI Codex Micro vendor HID access.
+# Match the exact VID/PID on Bluetooth (0005) or USB (0003) transports.
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", KERNELS=="000[35]:303A:8360.*", GROUP="input", MODE="0660", TAG+="uaccess"

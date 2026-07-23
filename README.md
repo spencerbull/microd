@@ -121,17 +121,41 @@ cargo run -p herdr-bridge
 
 ## Linux (Bluetooth or USB)
 
-Linux exposes the Codex Micro vendor collection through `hidraw`. Grant the
-logged-in user's `input` group access to the exact device on both Bluetooth
-(`0005`) and USB (`0003`) transports:
+Linux exposes the Codex Micro vendor collection through `hidraw`, which is
+root-only by default. Do not run `microd` with `sudo`; install the included
+exact-device udev rule and add your account to the `input` group instead. The
+rule covers both Bluetooth (`0005`) and USB (`0003`) without opening access to
+unrelated HID devices:
 
-```udev
-# /etc/udev/rules.d/99-codex-micro.rules
-SUBSYSTEM=="hidraw", KERNEL=="hidraw*", KERNELS=="000[35]:303A:8360.*", GROUP="input", MODE="0660", TAG+="uaccess"
+```bash
+sudo install -Dm644 udev/99-codex-micro.rules \
+  /etc/udev/rules.d/99-codex-micro.rules
+sudo usermod --append --groups input "$USER"
+sudo udevadm control --reload-rules
+sudo udevadm trigger --action=change --subsystem-match=hidraw
 ```
 
-After reloading udev rules and reconnecting the pad, build and install the
-binaries and user units:
+Log out and back in if `input` was newly added to your account, then reconnect
+the pad so Bluetooth or USB recreates the matching `hidraw` node. Verify that
+the node is readable and writable as your normal user:
+
+```bash
+id -nG | tr ' ' '\n' | grep -x input
+for device in /dev/hidraw*; do
+  if udevadm info --query=path --name="$device" |
+    grep -Eiq '000[35]:303A:8360'; then
+    stat -c '%n %A %U:%G' "$device"
+    test -r "$device" && test -w "$device"
+  fi
+done
+```
+
+The matching line should show mode `crw-rw----` and group `input`. If the loop
+prints nothing, reconnect the pad and try again. Avoid `chmod` on
+`/dev/hidraw*`: device nodes are recreated on every reconnect, and a broad rule
+would expose unrelated keyboards and security devices.
+
+Build and install the binaries and user units without `sudo`:
 
 ```bash
 cargo build --release --workspace
