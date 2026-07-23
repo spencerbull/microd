@@ -185,6 +185,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hidapi",
+ "libc",
  "serde_json",
 ]
 

@@ -1,0 +1,24 @@
+[Unit]
+Description=Work Louder Codex Micro HID daemon
+Documentation=https://github.com/PlaneshiftDev/microd
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/microd run
+Restart=on-failure
+RestartSec=2s
+RuntimeDirectory=microd
+RuntimeDirectoryMode=0700
+UMask=0077
+Environment=MICROD_SOCKET=%t/microd/microd.sock
+Nice=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=default.target

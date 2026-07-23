@@ -69,7 +69,11 @@ pub struct GestureEngine {
 
 impl GestureEngine {
     pub fn new(config: Config) -> Self {
-        GestureEngine { config, joy_armed: true, ..Default::default() }
+        GestureEngine {
+            config,
+            joy_armed: true,
+            ..Default::default()
+        }
     }
 
     pub fn key_press(&mut self, key: &str, now: Instant) -> Vec<Gesture> {
@@ -78,15 +82,23 @@ impl GestureEngine {
         // Second tap within the window upgrades to double_tap.
         if let Some(first) = self.pending_tap.remove(key) {
             if now.duration_since(first) <= self.config.double_window {
-                out.push(Gesture::DoubleTap { key: key.to_string() });
+                out.push(Gesture::DoubleTap {
+                    key: key.to_string(),
+                });
                 self.held.insert(
                     key.to_string(),
-                    Held { pressed_at: now, consumed: true, long_fired: false },
+                    Held {
+                        pressed_at: now,
+                        consumed: true,
+                        long_fired: false,
+                    },
                 );
                 return out;
             }
             // Window expired but tick() hasn't run: emit the stale tap now.
-            out.push(Gesture::Tap { key: key.to_string() });
+            out.push(Gesture::Tap {
+                key: key.to_string(),
+            });
         }
 
         // A press while other keys are held is a chord; every physically held
@@ -100,17 +112,28 @@ impl GestureEngine {
                     h.consumed = true;
                 }
             }
-            out.push(Gesture::Chord { key: key.to_string(), held: held_names });
+            out.push(Gesture::Chord {
+                key: key.to_string(),
+                held: held_names,
+            });
             self.held.insert(
                 key.to_string(),
-                Held { pressed_at: now, consumed: true, long_fired: false },
+                Held {
+                    pressed_at: now,
+                    consumed: true,
+                    long_fired: false,
+                },
             );
             return out;
         }
 
         self.held.insert(
             key.to_string(),
-            Held { pressed_at: now, consumed: false, long_fired: false },
+            Held {
+                pressed_at: now,
+                consumed: false,
+                long_fired: false,
+            },
         );
         out
     }
@@ -125,13 +148,17 @@ impl GestureEngine {
         let elapsed = now.duration_since(held.pressed_at);
         if elapsed >= self.config.long_press {
             // Threshold passed but tick() didn't fire yet.
-            return vec![Gesture::LongPress { key: key.to_string() }];
+            return vec![Gesture::LongPress {
+                key: key.to_string(),
+            }];
         }
         if self.config.double_tap_keys.contains(key) {
             self.pending_tap.insert(key.to_string(), now);
             return Vec::new();
         }
-        vec![Gesture::Tap { key: key.to_string() }]
+        vec![Gesture::Tap {
+            key: key.to_string(),
+        }]
     }
 
     /// Encoder step. Alone it emits nothing (raw steps already flow to
@@ -148,7 +175,10 @@ impl GestureEngine {
                 h.consumed = true;
             }
         }
-        vec![Gesture::Chord { key: key.to_string(), held: held_names }]
+        vec![Gesture::Chord {
+            key: key.to_string(),
+            held: held_names,
+        }]
     }
 
     pub fn joystick(&mut self, angle: f64, deflection: f64) -> Vec<Gesture> {
@@ -283,7 +313,10 @@ mod tests {
         let out = e.key_press("AG02", t0 + ms(100));
         assert_eq!(
             out,
-            vec![Gesture::Chord { key: "AG02".into(), held: vec!["ACT12".into()] }]
+            vec![Gesture::Chord {
+                key: "AG02".into(),
+                held: vec!["ACT12".into()]
+            }]
         );
         // Neither release produces anything: both were consumed by the chord.
         assert!(e.key_release("AG02", t0 + ms(200)).is_empty());
@@ -307,13 +340,18 @@ mod tests {
         // Modifier held past the threshold: long_press fires...
         assert_eq!(
             e.tick(t0 + ms(500)),
-            vec![Gesture::LongPress { key: "ACT12".into() }]
+            vec![Gesture::LongPress {
+                key: "ACT12".into()
+            }]
         );
         // ...but a second key press must still form the chord.
         let out = e.key_press("AG02", t0 + ms(900));
         assert_eq!(
             out,
-            vec![Gesture::Chord { key: "AG02".into(), held: vec!["ACT12".into()] }]
+            vec![Gesture::Chord {
+                key: "AG02".into(),
+                held: vec!["ACT12".into()]
+            }]
         );
         assert!(e.key_release("AG02", t0 + ms(1000)).is_empty());
         assert!(e.key_release("ACT12", t0 + ms(1100)).is_empty());
@@ -326,13 +364,19 @@ mod tests {
         e.key_press("ACT12", t0);
         assert_eq!(
             e.key_press("AG02", t0 + ms(100)),
-            vec![Gesture::Chord { key: "AG02".into(), held: vec!["ACT12".into()] }]
+            vec![Gesture::Chord {
+                key: "AG02".into(),
+                held: vec!["ACT12".into()]
+            }]
         );
         e.key_release("AG02", t0 + ms(200));
         // Modifier still down: a second key must chord again.
         assert_eq!(
             e.key_press("AG03", t0 + ms(300)),
-            vec![Gesture::Chord { key: "AG03".into(), held: vec!["ACT12".into()] }]
+            vec![Gesture::Chord {
+                key: "AG03".into(),
+                held: vec!["ACT12".into()]
+            }]
         );
         e.key_release("AG03", t0 + ms(400));
         assert!(e.key_release("ACT12", t0 + ms(500)).is_empty());
@@ -351,12 +395,18 @@ mod tests {
         e.key_press("ACT12", t0);
         assert_eq!(
             e.step("ENC_CW", t0 + ms(100)),
-            vec![Gesture::Chord { key: "ENC_CW".into(), held: vec!["ACT12".into()] }]
+            vec![Gesture::Chord {
+                key: "ENC_CW".into(),
+                held: vec!["ACT12".into()]
+            }]
         );
         // Continued turning keeps chording.
         assert_eq!(
             e.step("ENC_CW", t0 + ms(150)),
-            vec![Gesture::Chord { key: "ENC_CW".into(), held: vec!["ACT12".into()] }]
+            vec![Gesture::Chord {
+                key: "ENC_CW".into(),
+                held: vec!["ACT12".into()]
+            }]
         );
         // The held key's own tap was consumed.
         assert!(e.key_release("ACT12", t0 + ms(300)).is_empty());
@@ -366,10 +416,16 @@ mod tests {
     fn flick_fires_once_and_rearms() {
         let mut e = engine();
         assert!(e.joystick(0.75, 0.5).is_empty()); // armed but below fire threshold
-        assert_eq!(e.joystick(0.75, 1.0), vec![Gesture::Flick { direction: "up" }]);
+        assert_eq!(
+            e.joystick(0.75, 1.0),
+            vec![Gesture::Flick { direction: "up" }]
+        );
         assert!(e.joystick(0.75, 1.0).is_empty()); // not re-armed yet
         assert!(e.joystick(0.0, 0.1).is_empty()); // re-arm
-        assert_eq!(e.joystick(0.5, 0.95), vec![Gesture::Flick { direction: "left" }]);
+        assert_eq!(
+            e.joystick(0.5, 0.95),
+            vec![Gesture::Flick { direction: "left" }]
+        );
     }
 
     #[test]
