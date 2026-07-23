@@ -842,6 +842,39 @@ fn upsert(slots: &mut [Option<Slot>; SLOTS], info: &Value) {
     }
 }
 
+fn rebuild_slots_in_live_order(slots: &mut [Option<Slot>; SLOTS], live: &[&Value]) {
+    let previous = slots.clone();
+    for slot in previous.iter().flatten() {
+        let still_live = live
+            .iter()
+            .any(|agent| agent.get("pane_id").and_then(Value::as_str) == Some(&slot.pane_id));
+        if !still_live {
+            println!("agent gone: {} ({})", slot.label, slot.pane_id);
+        }
+    }
+
+    let mut ordered: [Option<Slot>; SLOTS] = Default::default();
+    for (index, agent) in live
+        .iter()
+        .copied()
+        .filter(|agent| agent.get("pane_id").and_then(Value::as_str).is_some())
+        .take(SLOTS)
+        .enumerate()
+    {
+        let pane_id = agent
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .expect("filtered pane id");
+        ordered[index] = previous
+            .iter()
+            .flatten()
+            .find(|slot| slot.pane_id == pane_id)
+            .cloned();
+        upsert(&mut ordered, agent);
+    }
+    *slots = ordered;
+}
+
 /// Rebuild slot state from the server. Live agents are the union of
 /// registered agents (agent.list, validated against panes that still exist —
 /// the registry can hold stale records for panes removed via tab/workspace
@@ -887,25 +920,12 @@ fn reconcile(socket: &PathBuf, slots: &mut [Option<Slot>; SLOTS]) -> Result<BTre
         }
     }
 
-    for slot in slots.iter_mut() {
-        if let Some(s) = slot {
-            let still_live = live
-                .iter()
-                .any(|a| a.get("pane_id").and_then(Value::as_str) == Some(s.pane_id.as_str()));
-            if !still_live {
-                println!("agent gone: {} ({})", s.label, s.pane_id);
-                *slot = None;
-            }
-        }
-    }
     let agent_panes = live
         .iter()
         .filter_map(|agent| agent.get("pane_id").and_then(Value::as_str))
         .map(str::to_string)
         .collect();
-    for agent in live {
-        upsert(slots, agent);
-    }
+    rebuild_slots_in_live_order(slots, &live);
     Ok(agent_panes)
 }
 
@@ -1830,6 +1850,48 @@ mod tests {
     }
 
     #[test]
+    fn slots_follow_authoritative_live_order_and_preserve_review_state() {
+        let mut slots = [
+            Some(slot("p1", "working")),
+            Some(slot("p2", "idle")),
+            None,
+            None,
+            None,
+            None,
+        ];
+        slots[1].as_mut().unwrap().review_ready = true;
+        let p2 = json!({"pane_id":"p2","name":"codex","agent_status":"idle"});
+        let p1 = json!({"pane_id":"p1","name":"codex","agent_status":"working"});
+        let p3 = json!({"pane_id":"p3","name":"codex","agent_status":"blocked"});
+
+        rebuild_slots_in_live_order(&mut slots, &[&p2, &p1, &p3]);
+
+        assert_eq!(
+            slots
+                .iter()
+                .flatten()
+                .map(|slot| slot.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p2", "p1", "p3"]
+        );
+        assert!(slots[0].as_ref().unwrap().review_ready);
+
+        let p1_idle = json!({"pane_id":"p1","name":"codex","agent_status":"idle"});
+        rebuild_slots_in_live_order(&mut slots, &[&p1_idle, &p2]);
+
+        assert_eq!(
+            slots
+                .iter()
+                .flatten()
+                .map(|slot| slot.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p1", "p2"]
+        );
+        assert!(slots[0].as_ref().unwrap().review_ready);
+        assert!(slots[1].as_ref().unwrap().review_ready);
+    }
+
+    #[test]
     fn reconcile_discards_stale_agents_and_keeps_detected_agents() {
         let path = socket_path("reconcile");
         let listener = UnixListener::bind(&path).unwrap();
@@ -1867,6 +1929,63 @@ mod tests {
             .map(|slot| slot.pane_id.as_str())
             .collect();
         assert_eq!(ids, BTreeSet::from(["detected", "live"]));
+        server.join().unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn repeated_reconcile_refreshes_agent_key_order() {
+        let path = socket_path("reorder");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let mut agent_list_calls = 0;
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&request).unwrap();
+                let response = match request.get("method").and_then(Value::as_str) {
+                    Some("agent.list") => {
+                        let agents = if agent_list_calls == 0 {
+                            json!([
+                                {"pane_id":"p1","name":"codex","agent_status":"idle"},
+                                {"pane_id":"p2","name":"codex","agent_status":"working"}
+                            ])
+                        } else {
+                            json!([
+                                {"pane_id":"p2","name":"codex","agent_status":"working"},
+                                {"pane_id":"p1","name":"codex","agent_status":"idle"}
+                            ])
+                        };
+                        agent_list_calls += 1;
+                        json!({"id":"r","result":{"agents":agents}})
+                    }
+                    Some("pane.list") => json!({"id":"r","result":{"panes":[
+                        {"pane_id":"p1"},
+                        {"pane_id":"p2"}
+                    ]}}),
+                    method => panic!("unexpected method: {method:?}"),
+                };
+                send_line(&mut stream, &response).unwrap();
+            }
+        });
+        let mut slots: [Option<Slot>; SLOTS] = Default::default();
+
+        reconcile(&path, &mut slots).unwrap();
+        slots[0].as_mut().unwrap().review_ready = true;
+        reconcile(&path, &mut slots).unwrap();
+
+        assert_eq!(
+            slots
+                .iter()
+                .flatten()
+                .map(|slot| slot.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p2", "p1"]
+        );
+        assert!(slots[1].as_ref().unwrap().review_ready);
         server.join().unwrap();
         fs::remove_file(path).unwrap();
     }

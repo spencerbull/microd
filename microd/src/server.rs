@@ -9,8 +9,8 @@
 //! Client -> server (one command per line; "id" is echoed in the reply):
 //!   {"id":1,"cmd":"lights","lights":[{"slot":0,"color":65280,"effect":"breath","speed":50}]}
 //!   {"id":2,"cmd":"lighting_config","ambient":{"color":65280,"effect":"solid","brightness":1.0,"speed":0.0,"magic":0.0},"keys":{"color":0,"effect":"off","brightness":0.0,"speed":0.0,"magic":0.0}}
-//!   {"id":2,"cmd":"clear"}
-//!   {"id":3,"cmd":"raw","method":"device.status","params":{}}
+//!   {"id":3,"cmd":"clear"}
+//!   {"id":4,"cmd":"raw","method":"device.status","params":{}}
 //!   -> {"id":1,"ok":true} or {"id":1,"ok":false,"error":"..."}
 //!   (device responses to "raw" arrive as a device_message broadcast)
 
@@ -545,7 +545,7 @@ fn send_device_request(
                 "write {method} to Codex Micro: {e:#}"
             )));
         }
-        let response = match rx.recv_timeout(Duration::from_millis(500)) {
+        let response = match rx.recv_timeout(device::request_timeout(attempts)) {
             Ok(response) => response,
             Err(mpsc::RecvTimeoutError::Timeout) if attempt < attempts => {
                 pending.lock().expect("pending lock").remove(&id);

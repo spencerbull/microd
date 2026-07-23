@@ -68,7 +68,7 @@ surface for Herdr on this Omarchy Linux host.
 - [x] Explicit service-to-direct-CLI ownership switch and service restoration.
 - [x] `cargo fmt --check`.
 - [x] `cargo clippy --workspace --all-targets -- -D warnings`.
-- [x] `cargo test --workspace` (51 tests: 15 bridge, 36 microd).
+- [x] `cargo test --workspace` (54 tests: 17 bridge, 37 microd).
 - [x] Independent review.
 - [ ] Final physical-device regression.
 
@@ -109,6 +109,10 @@ surface for Herdr on this Omarchy Linux host.
   binary also passed a synthetic `AG00` integration test with
   `HYPRLAND_INSTANCE_SIGNATURE` removed, moving from another Kitty window on
   workspace 3 to Herdr on workspace 1 while selecting pane `wK:p1`.
+- The bridge polls Herdr every five seconds while the event stream is live.
+  Reconciliation now rebuilds all six Agent Key slots in Herdr's current
+  authoritative order instead of preserving historical slot positions, while
+  retaining each pane's latched review-ready state.
 - SIGKILL recovery passed independently for both services. An isolated Herdr
   server stop/start recovered, and a real Codex Micro Bluetooth disconnect
   caused the expected HID failure, supervised restart, device rediscovery,

@@ -19,6 +19,14 @@ const CHUNK_MAX: usize = 61;
 const MSG_TYPE_JSON: u8 = 2;
 const INTER_CHUNK_DELAY: Duration = Duration::from_millis(4);
 
+pub(crate) fn request_timeout(attempts: usize) -> Duration {
+    if attempts > 1 {
+        Duration::from_millis(500)
+    } else {
+        Duration::from_secs(2)
+    }
+}
+
 /// Effect enum values documented by Work Louder's Codex Micro SDK.
 ///
 /// The older reverse-engineered table incorrectly called code 3 "flash";
@@ -162,11 +170,7 @@ pub fn request(dev: &HidDevice, method: &str, params: Option<Value>) -> Result<(
         send_json(dev, &msg)?;
         println!("sent {method} (attempt {attempt}/{attempts})");
 
-        let timeout = if attempts > 1 {
-            Duration::from_millis(500)
-        } else {
-            Duration::from_secs(2)
-        };
+        let timeout = request_timeout(attempts);
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             for value in reader.poll(dev)? {
@@ -429,6 +433,12 @@ fn known_key(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_timeout_preserves_the_single_attempt_firmware_budget() {
+        assert_eq!(request_timeout(1), Duration::from_secs(2));
+        assert_eq!(request_timeout(3), Duration::from_millis(500));
+    }
 
     #[test]
     fn fragmented_json_is_reassembled() {
