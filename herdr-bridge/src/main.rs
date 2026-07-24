@@ -1058,8 +1058,9 @@ fn handle_pad_event(
         PadEvent::Act(7) => send_keys_to_focused(socket, "esc")?,
         // ACT08 = jump to the next agent that needs attention
         PadEvent::Act(8) => focus_next_with_status(socket, slots, "blocked")?,
-        // The physical Enter key adjacent to the microphone is ACT11 on v0.4.1.
-        PadEvent::Act(11) => send_keys_to_focused(socket, "enter")?,
+        // The key adjacent to the microphone has reported as ACT11 and ACT12
+        // across observed firmware/layout states. Treat both as Enter.
+        PadEvent::Act(11 | 12) => send_keys_to_focused(socket, "enter")?,
         PadEvent::Act(n) => println!("ACT{n:02} pressed (unmapped)"),
         PadEvent::Dictation(_) => anyhow::bail!("dictation event reached Herdr action handler"),
         PadEvent::EncStep(dir) => cycle_agent_focus(socket, slots, dir)?,
@@ -1885,6 +1886,14 @@ mod tests {
             ),
             (
                 PadEvent::Act(11),
+                2,
+                vec![
+                    ("pane.current", json!({})),
+                    ("pane.send_keys", json!({"pane_id":"p0","keys":["enter"]})),
+                ],
+            ),
+            (
+                PadEvent::Act(12),
                 2,
                 vec![
                     ("pane.current", json!({})),

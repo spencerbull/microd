@@ -112,7 +112,7 @@ Controls:
 | `ACT07` | send `esc` to the focused pane (deny/interrupt) |
 | `ACT08` | jump to the next **blocked** agent |
 | mic key `ACT10` | optional Omarchy/Voxtype push-to-talk with `--voxtype`; otherwise unmapped |
-| Enter key `ACT11` | send `enter` to the focused pane |
+| key next to mic `ACT11`/`ACT12` | send `enter` to the focused pane |
 | joystick left/right | previous/next tab in the focused workspace |
 | joystick up/down | previous/next workspace |
 
