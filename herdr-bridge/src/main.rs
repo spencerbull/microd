@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 const SLOTS: usize = 6;
 const HYPRLAND_HERDR_SELECTOR: &str = "title:^herdr$";
+const LIGHT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
 #[command(name = "herdr-bridge", about = "Bridge microd pad events onto herdr")]
@@ -32,6 +33,9 @@ struct Cli {
     /// Path to microd (default: $MICROD_SOCKET, then $XDG_RUNTIME_DIR/microd/microd.sock)
     #[arg(long)]
     hub: Option<PathBuf>,
+    /// Map ACT10 press/release events to Voxtype push-to-talk
+    #[arg(long)]
+    voxtype: bool,
     /// Stop a bridge-owned Voxtype recording and exit (used by systemd cleanup)
     #[arg(long, hide = true)]
     cleanup_dictation: bool,
@@ -89,6 +93,16 @@ struct HubAck {
     id: u64,
     ok: bool,
     error: Option<String>,
+}
+
+struct RenderedFrame {
+    value: Value,
+    confirmed_at: Instant,
+}
+
+struct ReconciledState {
+    agent_panes: BTreeSet<String>,
+    focused_pane_id: Option<String>,
 }
 
 struct DictationSession {
@@ -184,8 +198,9 @@ fn cleanup_owned_dictation() -> Result<()> {
 }
 
 fn run_voxtype(action: &str) -> Result<()> {
+    let args = voxtype_record_args(action);
     let output = Command::new("voxtype")
-        .args(["record", action])
+        .args(&args)
         .output()
         .with_context(|| format!("run voxtype record {action}"))?;
     if !output.status.success() {
@@ -193,6 +208,17 @@ fn run_voxtype(action: &str) -> Result<()> {
         anyhow::bail!("voxtype record {action} failed: {}", error.trim());
     }
     Ok(())
+}
+
+fn voxtype_record_args(action: &str) -> Vec<&str> {
+    let mut args = vec!["record", action];
+    if action == "start" {
+        // Codex Micro has a dedicated send key, so microphone release should
+        // only stop/transcribe/type. Override output and submission modes for
+        // this recording without changing the user's global preferences.
+        args.extend(["--type", "--no-auto-submit", "--no-smart-auto-submit"]);
+    }
+    args
 }
 
 fn voxtype_status() -> Result<String> {
@@ -293,18 +319,20 @@ fn main() -> Result<()> {
     let (pad_tx, pad_rx) = mpsc::channel::<PadEvent>();
     let (ack_tx, ack_rx) = mpsc::channel::<HubAck>();
     let (voice_tx, voice_rx) = mpsc::channel();
-    let _dictation_thread = DictationThread::start(voice_tx);
-    let dictation_tx = _dictation_thread.sender();
+    let dictation_thread = cli.voxtype.then(|| DictationThread::start(voice_tx));
+    let dictation_tx = dictation_thread.as_ref().map(DictationThread::sender);
     let hub_thread = std::thread::spawn(move || hub_loop(hub, pad_tx, ack_tx, dictation_tx));
 
     let mut slots: [Option<Slot>; SLOTS] = Default::default();
-    let mut rendered: Option<Value> = None;
+    let mut rendered: Option<RenderedFrame> = None;
     let mut voice_state = VoiceState::Idle;
     let mut next_hub_id = 1u64;
     let mut line = String::new();
     let mut last_reconcile = Instant::now();
 
-    let mut agent_panes = wait_reconcile(&herdr_socket, &mut slots);
+    let initial_state = wait_reconcile(&herdr_socket, &mut slots);
+    let mut agent_panes = initial_state.agent_panes;
+    let mut focused_pane_id = initial_state.focused_pane_id;
     let mut lines = subscribe(&herdr_socket, &agent_panes)?;
     render(
         &hub_writer,
@@ -360,7 +388,12 @@ fn main() -> Result<()> {
         )?;
         if need_reconcile {
             if let Ok(current) = reconcile(&herdr_socket, &mut slots) {
-                agent_panes = current;
+                acknowledge_focus_transition(
+                    &mut slots,
+                    &mut focused_pane_id,
+                    current.focused_pane_id.as_deref(),
+                );
+                agent_panes = current.agent_panes;
                 lines = subscribe(&herdr_socket, &agent_panes)?;
                 last_reconcile = Instant::now();
             }
@@ -384,8 +417,13 @@ fn main() -> Result<()> {
                 if msg.get("event").is_some() {
                     match reconcile(&herdr_socket, &mut slots) {
                         Ok(current) => {
-                            if current != agent_panes {
-                                agent_panes = current;
+                            acknowledge_focus_transition(
+                                &mut slots,
+                                &mut focused_pane_id,
+                                current.focused_pane_id.as_deref(),
+                            );
+                            if current.agent_panes != agent_panes {
+                                agent_panes = current.agent_panes;
                                 lines = subscribe(&herdr_socket, &agent_panes)?;
                             }
                             last_reconcile = Instant::now();
@@ -409,8 +447,13 @@ fn main() -> Result<()> {
                 if last_reconcile.elapsed() >= Duration::from_secs(5) {
                     match reconcile(&herdr_socket, &mut slots) {
                         Ok(current) => {
-                            if current != agent_panes {
-                                agent_panes = current;
+                            acknowledge_focus_transition(
+                                &mut slots,
+                                &mut focused_pane_id,
+                                current.focused_pane_id.as_deref(),
+                            );
+                            if current.agent_panes != agent_panes {
+                                agent_panes = current.agent_panes;
                                 lines = subscribe(&herdr_socket, &agent_panes)?;
                             }
                             render(
@@ -476,6 +519,7 @@ fn subscription_request(agent_panes: &BTreeSet<String>) -> Value {
         json!({"type": "pane.exited"}),
         json!({"type": "pane.moved"}),
         json!({"type": "pane.agent_detected"}),
+        json!({"type": "pane.focused"}),
         json!({"type": "tab.closed"}),
         json!({"type": "workspace.closed"}),
     ];
@@ -515,7 +559,7 @@ fn subscribe(socket: &PathBuf, agent_panes: &BTreeSet<String>) -> Result<BufRead
     Ok(lines)
 }
 
-fn wait_reconcile(socket: &PathBuf, slots: &mut [Option<Slot>; SLOTS]) -> BTreeSet<String> {
+fn wait_reconcile(socket: &PathBuf, slots: &mut [Option<Slot>; SLOTS]) -> ReconciledState {
     let mut waiting = false;
     loop {
         match reconcile(socket, slots) {
@@ -536,7 +580,7 @@ fn hub_loop(
     hub: UnixStream,
     pad_tx: mpsc::Sender<PadEvent>,
     ack_tx: mpsc::Sender<HubAck>,
-    dictation_tx: mpsc::Sender<DictationCommand>,
+    dictation_tx: Option<mpsc::Sender<DictationCommand>>,
 ) {
     // Joystick gesture arming: fire once when deflection crosses 0.9, re-arm
     // once it falls back below 0.3.
@@ -563,13 +607,16 @@ fn hub_loop(
             continue;
         }
         let pad_event = match msg.get("event").and_then(Value::as_str) {
-            Some("key") => decode_key(&msg),
+            Some("key") => decode_key(&msg, dictation_tx.is_some()),
             Some("joystick") => decode_joystick(&msg, &mut joy_armed),
             _ => None,
         };
         if let Some(pe) = pad_event {
             match pe {
                 PadEvent::Dictation(active) => {
+                    let Some(dictation_tx) = dictation_tx.as_ref() else {
+                        continue;
+                    };
                     if dictation_tx.send(DictationCommand::Set(active)).is_err() {
                         return;
                     }
@@ -584,15 +631,15 @@ fn hub_loop(
     }
 }
 
-fn decode_key(msg: &Value) -> Option<PadEvent> {
+fn decode_key(msg: &Value, voxtype: bool) -> Option<PadEvent> {
     let key = msg.get("key").and_then(Value::as_str)?;
     let action = msg.get("action").and_then(Value::as_str)?;
     match (action, key) {
         ("step", "ENC_CW") => Some(PadEvent::EncStep(1)),
         ("step", "ENC_CC") => Some(PadEvent::EncStep(-1)),
         ("press", "ENC_CLK") => Some(PadEvent::EncClick),
-        ("press", "ACT10") => Some(PadEvent::Dictation(true)),
-        ("release", "ACT10") => Some(PadEvent::Dictation(false)),
+        ("press", "ACT10") if voxtype => Some(PadEvent::Dictation(true)),
+        ("release", "ACT10") if voxtype => Some(PadEvent::Dictation(false)),
         ("press", k) => {
             if let Some(n) = k.strip_prefix("AG").and_then(|n| n.parse::<usize>().ok()) {
                 Some(PadEvent::AgentKey(n))
@@ -636,7 +683,7 @@ fn render(
     next_id: &mut u64,
     slots: &[Option<Slot>; SLOTS],
     voice_state: VoiceState,
-    rendered: &mut Option<Value>,
+    rendered: &mut Option<RenderedFrame>,
 ) -> Result<()> {
     let lights: Value = slots
         .iter()
@@ -662,7 +709,9 @@ fn render(
         "keys": lighting_side("off", 0, 0.0, 0.0),
     });
     let frame = json!({"lighting_config": lighting_config, "lights": lights});
-    if rendered.as_ref() == Some(&frame) {
+    if rendered.as_ref().is_some_and(|rendered| {
+        rendered.value == frame && rendered.confirmed_at.elapsed() < LIGHT_REFRESH_INTERVAL
+    }) {
         return Ok(());
     }
 
@@ -684,7 +733,10 @@ fn render(
         json!({ "cmd": "lights", "lights": frame["lights"] }),
         "agent-key lighting",
     )?;
-    *rendered = Some(frame);
+    *rendered = Some(RenderedFrame {
+        value: frame,
+        confirmed_at: Instant::now(),
+    });
     Ok(())
 }
 
@@ -725,12 +777,16 @@ fn ambient_lighting(slots: &[Option<Slot>; SLOTS], voice_state: VoiceState) -> V
 }
 
 fn effective_status(slot: &Slot) -> &str {
-    if slot.review_ready {
-        "done"
-    } else if slot.status == "done" {
-        "idle"
-    } else {
-        slot.status.as_str()
+    effective_status_for(&slot.status, slot.review_ready)
+}
+
+fn effective_status_for(status: &str, review_ready: bool) -> &str {
+    match status {
+        status @ ("error" | "failed" | "blocked" | "working") => status,
+        "done" if review_ready => "done",
+        "done" => "idle",
+        _ if review_ready => "done",
+        status => status,
     }
 }
 
@@ -832,6 +888,19 @@ fn upsert(slots: &mut [Option<Slot>; SLOTS], info: &Value) {
             "idle" => existing.review_ready,
             _ => false,
         };
+        if existing.status != new.status || existing.review_ready != review_ready {
+            println!(
+                "agent state {} ({}): raw {} -> {}; effective {} -> {}; review-ready {} -> {}",
+                new.label,
+                new.pane_id,
+                existing.status,
+                new.status,
+                effective_status(existing),
+                effective_status_for(&new.status, review_ready),
+                existing.review_ready,
+                review_ready,
+            );
+        }
         *existing = Slot {
             review_ready,
             ..new
@@ -840,6 +909,46 @@ fn upsert(slots: &mut [Option<Slot>; SLOTS], info: &Value) {
         println!("agent {} ({}) -> slot", new.label, new.pane_id);
         *free = Some(new);
     }
+}
+
+fn acknowledge_review_ready(
+    slots: &mut [Option<Slot>; SLOTS],
+    pane_id: &str,
+    reason: &str,
+) -> bool {
+    let Some(slot) = slots
+        .iter_mut()
+        .flatten()
+        .find(|slot| slot.pane_id == pane_id)
+    else {
+        return false;
+    };
+    if !slot.review_ready {
+        return false;
+    }
+    let previous_effective = effective_status(slot).to_string();
+    slot.review_ready = false;
+    println!(
+        "agent attention acknowledged by {reason}: {} ({}); effective {} -> {}",
+        slot.label,
+        slot.pane_id,
+        previous_effective,
+        effective_status(slot),
+    );
+    true
+}
+
+fn acknowledge_focus_transition(
+    slots: &mut [Option<Slot>; SLOTS],
+    previous_pane_id: &mut Option<String>,
+    current_pane_id: Option<&str>,
+) -> bool {
+    if previous_pane_id.as_deref() == current_pane_id {
+        return false;
+    }
+    *previous_pane_id = current_pane_id.map(str::to_string);
+    current_pane_id
+        .is_some_and(|pane_id| acknowledge_review_ready(slots, pane_id, "Herdr pane focus"))
 }
 
 fn rebuild_slots_in_live_order(slots: &mut [Option<Slot>; SLOTS], live: &[&Value]) {
@@ -879,7 +988,7 @@ fn rebuild_slots_in_live_order(slots: &mut [Option<Slot>; SLOTS], live: &[&Value
 /// registered agents (agent.list, validated against panes that still exist —
 /// the registry can hold stale records for panes removed via tab/workspace
 /// close) and panes with a detected agent, which don't appear in agent.list.
-fn reconcile(socket: &PathBuf, slots: &mut [Option<Slot>; SLOTS]) -> Result<BTreeSet<String>> {
+fn reconcile(socket: &PathBuf, slots: &mut [Option<Slot>; SLOTS]) -> Result<ReconciledState> {
     let fetch = |method: &str| {
         one_shot_response(socket, &json!({"id": "r", "method": method, "params": {}}))
     };
@@ -925,8 +1034,16 @@ fn reconcile(socket: &PathBuf, slots: &mut [Option<Slot>; SLOTS]) -> Result<BTre
         .filter_map(|agent| agent.get("pane_id").and_then(Value::as_str))
         .map(str::to_string)
         .collect();
+    let focused_pane_id = pane_records
+        .iter()
+        .find(|pane| pane.get("focused").and_then(Value::as_bool) == Some(true))
+        .and_then(|pane| pane.get("pane_id").and_then(Value::as_str))
+        .map(str::to_string);
     rebuild_slots_in_live_order(slots, &live);
-    Ok(agent_panes)
+    Ok(ReconciledState {
+        agent_panes,
+        focused_pane_id,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -942,9 +1059,7 @@ fn handle_pad_event(
             if let Some(slot) = slots.get(idx).and_then(Clone::clone) {
                 println!("key AG{idx:02} -> focus {} ({})", slot.label, slot.pane_id);
                 focus_pane(socket, &slot.pane_id)?;
-                if let Some(slot) = slots.get_mut(idx).and_then(Option::as_mut) {
-                    slot.review_ready = false;
-                }
+                acknowledge_review_ready(slots, &slot.pane_id, "Agent Key");
             } else {
                 // Empty agent slot: fall back to focusing the Nth workspace.
                 focus_workspace_by_index(socket, idx)?;
@@ -955,8 +1070,11 @@ fn handle_pad_event(
         PadEvent::Act(7) => send_keys_to_focused(socket, "esc")?,
         // ACT08 = jump to the next agent that needs attention
         PadEvent::Act(8) => focus_next_with_status(socket, slots, "blocked")?,
-        // The physical Enter key adjacent to the microphone is ACT11 on v0.4.1.
-        PadEvent::Act(11) => send_keys_to_focused(socket, "enter")?,
+        // ACT11 accompanies the microphone press on the observed Linux
+        // firmware path. It must not submit a draft when recording starts.
+        PadEvent::Act(11) => println!("ACT11 mic companion -> ignored"),
+        // The dedicated key next to the microphone reports ACT12.
+        PadEvent::Act(12) => send_keys_to_focused(socket, "enter")?,
         PadEvent::Act(n) => println!("ACT{n:02} pressed (unmapped)"),
         PadEvent::Dictation(_) => anyhow::bail!("dictation event reached Herdr action handler"),
         PadEvent::EncStep(dir) => cycle_agent_focus(socket, slots, dir)?,
@@ -1435,10 +1553,32 @@ mod tests {
     ) -> Vec<Value> {
         let path = socket_path("action");
         let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let (request_tx, request_rx) = mpsc::channel();
         let server = thread::spawn(move || {
-            for _ in 0..request_count {
-                let (mut stream, _) = listener.accept().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            for request_index in 0..request_count {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            panic!(
+                                "timed out waiting for action request {} of {request_count}",
+                                request_index + 1
+                            );
+                        }
+                        Err(error) => panic!("accept action request failed: {error}"),
+                    }
+                };
+                // macOS inherits O_NONBLOCK from the listener onto accepted
+                // Unix streams; restore blocking reads for the request body.
+                stream.set_nonblocking(false).unwrap();
                 let mut line = String::new();
                 BufReader::new(stream.try_clone().unwrap())
                     .read_line(&mut line)
@@ -1465,7 +1605,9 @@ mod tests {
         });
         let mut slots = slots.clone();
         handle_pad_event(event, &path, &mut slots).unwrap();
-        server.join().unwrap();
+        if let Err(panic) = server.join() {
+            std::panic::resume_unwind(panic);
+        }
         fs::remove_file(path).unwrap();
         request_rx.try_iter().collect()
     }
@@ -1485,6 +1627,7 @@ mod tests {
             "pane.exited",
             "pane.moved",
             "pane.agent_detected",
+            "pane.focused",
             "tab.closed",
             "workspace.closed",
         ] {
@@ -1519,6 +1662,7 @@ mod tests {
         ] {
             let path = socket_path("subscribe");
             let listener = UnixListener::bind(&path).unwrap();
+            let (release_tx, release_rx) = mpsc::channel();
             let server = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = String::new();
@@ -1530,8 +1674,10 @@ mod tests {
                     "events.subscribe"
                 );
                 send_line(&mut stream, &ack).unwrap();
+                release_rx.recv().unwrap();
             });
             let result = subscribe(&path, &BTreeSet::new());
+            release_tx.send(()).unwrap();
             assert_eq!(result.is_ok(), accepted);
             server.join().unwrap();
             fs::remove_file(path).unwrap();
@@ -1540,24 +1686,26 @@ mod tests {
 
     #[test]
     fn key_and_joystick_decoding_preserves_all_controls() {
-        for (key, action, expected) in [
-            ("AG00", "press", Some(PadEvent::AgentKey(0))),
-            ("AG05", "press", Some(PadEvent::AgentKey(5))),
-            ("ACT06", "press", Some(PadEvent::Act(6))),
-            ("ACT10", "press", Some(PadEvent::Dictation(true))),
-            ("ACT10", "release", Some(PadEvent::Dictation(false))),
-            ("ACT11", "press", Some(PadEvent::Act(11))),
-            ("ACT12", "press", Some(PadEvent::Act(12))),
-            ("ENC_CW", "step", Some(PadEvent::EncStep(1))),
-            ("ENC_CC", "step", Some(PadEvent::EncStep(-1))),
-            ("ENC_CLK", "press", Some(PadEvent::EncClick)),
-            ("AG00", "release", None),
+        for (key, action, voxtype, expected) in [
+            ("AG00", "press", false, Some(PadEvent::AgentKey(0))),
+            ("AG05", "press", false, Some(PadEvent::AgentKey(5))),
+            ("ACT06", "press", false, Some(PadEvent::Act(6))),
+            ("ACT10", "press", true, Some(PadEvent::Dictation(true))),
+            ("ACT10", "release", true, Some(PadEvent::Dictation(false))),
+            ("ACT10", "press", false, Some(PadEvent::Act(10))),
+            ("ACT10", "release", false, None),
+            ("ACT11", "press", false, Some(PadEvent::Act(11))),
+            ("ACT12", "press", false, Some(PadEvent::Act(12))),
+            ("ENC_CW", "step", false, Some(PadEvent::EncStep(1))),
+            ("ENC_CC", "step", false, Some(PadEvent::EncStep(-1))),
+            ("ENC_CLK", "press", false, Some(PadEvent::EncClick)),
+            ("AG00", "release", false, None),
         ] {
-            let decoded = decode_key(&json!({"key":key,"action":action}));
+            let decoded = decode_key(&json!({"key":key,"action":action}), voxtype);
             assert_eq!(
                 format!("{decoded:?}"),
                 format!("{expected:?}"),
-                "{key} {action}"
+                "{key} {action} (voxtype={voxtype})"
             );
         }
 
@@ -1581,6 +1729,28 @@ mod tests {
             );
             assert!(armed);
         }
+    }
+
+    #[test]
+    fn codex_micro_dictation_never_auto_submits() {
+        assert_eq!(
+            voxtype_record_args("start"),
+            vec![
+                "record",
+                "start",
+                "--type",
+                "--no-auto-submit",
+                "--no-smart-auto-submit"
+            ]
+        );
+        assert_eq!(voxtype_record_args("stop"), vec!["record", "stop"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "timed out waiting for action request 1 of 1")]
+    fn action_test_harness_times_out_when_a_request_is_missing() {
+        let slots: [Option<Slot>; SLOTS] = Default::default();
+        run_action(PadEvent::Act(11), &slots, 1);
     }
 
     #[test]
@@ -1686,7 +1856,7 @@ mod tests {
     #[test]
     fn hyprland_subprocess_is_killed_at_the_shared_deadline() {
         let started = Instant::now();
-        let mut command = Command::new("/usr/bin/sleep");
+        let mut command = Command::new("sleep");
         command.arg("1");
 
         let error = run_bounded_command(command, started + Duration::from_millis(25)).unwrap_err();
@@ -1774,8 +1944,9 @@ mod tests {
                     ("pane.focus", json!({"pane_id":"p1"})),
                 ],
             ),
+            (PadEvent::Act(11), 0, vec![]),
             (
-                PadEvent::Act(11),
+                PadEvent::Act(12),
                 2,
                 vec![
                     ("pane.current", json!({})),
@@ -1909,8 +2080,8 @@ mod tests {
                         {"pane_id":"stale","name":"codex","agent_status":"done"}
                     ]}}),
                     Some("pane.list") => json!({"id":"r","result":{"panes":[
-                        {"pane_id":"live"},
-                        {"pane_id":"detected","agent":"claude","agent_status":"idle"}
+                        {"pane_id":"live","focused":true},
+                        {"pane_id":"detected","agent":"claude","agent_status":"idle","focused":false}
                     ]}}),
                     method => panic!("unexpected method: {method:?}"),
                 };
@@ -1918,11 +2089,12 @@ mod tests {
             }
         });
         let mut slots = [Some(slot("old", "done")), None, None, None, None, None];
-        let panes = reconcile(&path, &mut slots).unwrap();
+        let state = reconcile(&path, &mut slots).unwrap();
         assert_eq!(
-            panes,
+            state.agent_panes,
             BTreeSet::from(["detected".to_string(), "live".to_string()])
         );
+        assert_eq!(state.focused_pane_id.as_deref(), Some("live"));
         let ids: BTreeSet<_> = slots
             .iter()
             .flatten()
@@ -1997,7 +2169,7 @@ mod tests {
         let (ack_tx, ack_rx) = mpsc::channel();
         let responder = thread::spawn(move || {
             let mut reader = BufReader::new(server.try_clone().unwrap());
-            for expected in ["lighting_config", "lights"] {
+            for expected in ["lighting_config", "lights", "lighting_config", "lights"] {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 let request: Value = serde_json::from_str(&line).unwrap();
@@ -2010,11 +2182,6 @@ mod tests {
                     })
                     .unwrap();
             }
-            server
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .unwrap();
-            let mut unexpected = String::new();
-            assert!(BufReader::new(server).read_line(&mut unexpected).is_err());
         });
         let slots = [
             Some(slot("p0", "working")),
@@ -2046,6 +2213,17 @@ mod tests {
         .unwrap();
         assert!(rendered.is_some());
         assert_eq!(next_id, 12);
+        rendered.as_mut().unwrap().confirmed_at = Instant::now() - LIGHT_REFRESH_INTERVAL;
+        render(
+            &hub,
+            &ack_rx,
+            &mut next_id,
+            &slots,
+            VoiceState::Idle,
+            &mut rendered,
+        )
+        .unwrap();
+        assert_eq!(next_id, 14);
         responder.join().unwrap();
     }
 
@@ -2117,6 +2295,49 @@ mod tests {
             &json!({"pane_id":"p0","agent":"codex","agent_status":"working"}),
         );
         assert!(!slots[0].as_ref().unwrap().review_ready);
+    }
+
+    #[test]
+    fn new_focus_transition_acknowledges_latched_review_state() {
+        let mut slots: [Option<Slot>; SLOTS] = Default::default();
+        upsert(
+            &mut slots,
+            &json!({"pane_id":"p0","agent":"codex","agent_status":"working","focused":true}),
+        );
+        upsert(
+            &mut slots,
+            &json!({"pane_id":"p0","agent":"codex","agent_status":"idle","focused":true}),
+        );
+        assert!(slots[0].as_ref().unwrap().review_ready);
+
+        let mut focused_pane_id = Some("p0".to_string());
+        assert!(!acknowledge_focus_transition(
+            &mut slots,
+            &mut focused_pane_id,
+            Some("p0"),
+        ));
+        assert!(slots[0].as_ref().unwrap().review_ready);
+
+        assert!(!acknowledge_focus_transition(
+            &mut slots,
+            &mut focused_pane_id,
+            Some("other"),
+        ));
+        assert!(acknowledge_focus_transition(
+            &mut slots,
+            &mut focused_pane_id,
+            Some("p0"),
+        ));
+        assert!(!slots[0].as_ref().unwrap().review_ready);
+    }
+
+    #[test]
+    fn authoritative_attention_states_override_a_stale_review_latch() {
+        for status in ["working", "blocked", "error", "failed"] {
+            let mut slot = slot("p0", status);
+            slot.review_ready = true;
+            assert_eq!(effective_status(&slot), status);
+        }
     }
 
     #[test]
