@@ -214,9 +214,9 @@ fn voxtype_record_args(action: &str) -> Vec<&str> {
     let mut args = vec!["record", action];
     if action == "start" {
         // Codex Micro has a dedicated send key, so microphone release should
-        // only stop/transcribe/type. Override both Voxtype submission modes
-        // for this recording without changing the user's global preferences.
-        args.extend(["--no-auto-submit", "--no-smart-auto-submit"]);
+        // only stop/transcribe/type. Override output and submission modes for
+        // this recording without changing the user's global preferences.
+        args.extend(["--type", "--no-auto-submit", "--no-smart-auto-submit"]);
     }
     args
 }
@@ -1553,10 +1553,29 @@ mod tests {
     ) -> Vec<Value> {
         let path = socket_path("action");
         let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let (request_tx, request_rx) = mpsc::channel();
         let server = thread::spawn(move || {
-            for _ in 0..request_count {
-                let (mut stream, _) = listener.accept().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            for request_index in 0..request_count {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            panic!(
+                                "timed out waiting for action request {} of {request_count}",
+                                request_index + 1
+                            );
+                        }
+                        Err(error) => panic!("accept action request failed: {error}"),
+                    }
+                };
                 let mut line = String::new();
                 BufReader::new(stream.try_clone().unwrap())
                     .read_line(&mut line)
@@ -1583,7 +1602,9 @@ mod tests {
         });
         let mut slots = slots.clone();
         handle_pad_event(event, &path, &mut slots).unwrap();
-        server.join().unwrap();
+        if let Err(panic) = server.join() {
+            std::panic::resume_unwind(panic);
+        }
         fs::remove_file(path).unwrap();
         request_rx.try_iter().collect()
     }
@@ -1714,11 +1735,19 @@ mod tests {
             vec![
                 "record",
                 "start",
+                "--type",
                 "--no-auto-submit",
                 "--no-smart-auto-submit"
             ]
         );
         assert_eq!(voxtype_record_args("stop"), vec!["record", "stop"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "timed out waiting for action request 1 of 1")]
+    fn action_test_harness_times_out_when_a_request_is_missing() {
+        let slots: [Option<Slot>; SLOTS] = Default::default();
+        run_action(PadEvent::Act(11), &slots, 1);
     }
 
     #[test]
