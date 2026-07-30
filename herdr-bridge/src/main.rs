@@ -1576,6 +1576,9 @@ mod tests {
                         Err(error) => panic!("accept action request failed: {error}"),
                     }
                 };
+                // macOS inherits O_NONBLOCK from the listener onto accepted
+                // Unix streams; restore blocking reads for the request body.
+                stream.set_nonblocking(false).unwrap();
                 let mut line = String::new();
                 BufReader::new(stream.try_clone().unwrap())
                     .read_line(&mut line)
