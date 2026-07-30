@@ -198,8 +198,9 @@ fn cleanup_owned_dictation() -> Result<()> {
 }
 
 fn run_voxtype(action: &str) -> Result<()> {
+    let args = voxtype_record_args(action);
     let output = Command::new("voxtype")
-        .args(["record", action])
+        .args(&args)
         .output()
         .with_context(|| format!("run voxtype record {action}"))?;
     if !output.status.success() {
@@ -207,6 +208,17 @@ fn run_voxtype(action: &str) -> Result<()> {
         anyhow::bail!("voxtype record {action} failed: {}", error.trim());
     }
     Ok(())
+}
+
+fn voxtype_record_args(action: &str) -> Vec<&str> {
+    let mut args = vec!["record", action];
+    if action == "start" {
+        // Codex Micro has a dedicated send key, so microphone release should
+        // only stop/transcribe/type. Override both Voxtype submission modes
+        // for this recording without changing the user's global preferences.
+        args.extend(["--no-auto-submit", "--no-smart-auto-submit"]);
+    }
+    args
 }
 
 fn voxtype_status() -> Result<String> {
@@ -1058,9 +1070,11 @@ fn handle_pad_event(
         PadEvent::Act(7) => send_keys_to_focused(socket, "esc")?,
         // ACT08 = jump to the next agent that needs attention
         PadEvent::Act(8) => focus_next_with_status(socket, slots, "blocked")?,
-        // The key adjacent to the microphone has reported as ACT11 and ACT12
-        // across observed firmware/layout states. Treat both as Enter.
-        PadEvent::Act(11 | 12) => send_keys_to_focused(socket, "enter")?,
+        // ACT11 accompanies the microphone press on the observed Linux
+        // firmware path. It must not submit a draft when recording starts.
+        PadEvent::Act(11) => println!("ACT11 mic companion -> ignored"),
+        // The dedicated key next to the microphone reports ACT12.
+        PadEvent::Act(12) => send_keys_to_focused(socket, "enter")?,
         PadEvent::Act(n) => println!("ACT{n:02} pressed (unmapped)"),
         PadEvent::Dictation(_) => anyhow::bail!("dictation event reached Herdr action handler"),
         PadEvent::EncStep(dir) => cycle_agent_focus(socket, slots, dir)?,
@@ -1694,6 +1708,20 @@ mod tests {
     }
 
     #[test]
+    fn codex_micro_dictation_never_auto_submits() {
+        assert_eq!(
+            voxtype_record_args("start"),
+            vec![
+                "record",
+                "start",
+                "--no-auto-submit",
+                "--no-smart-auto-submit"
+            ]
+        );
+        assert_eq!(voxtype_record_args("stop"), vec!["record", "stop"]);
+    }
+
+    #[test]
     fn hyprland_activation_uses_the_current_lua_dispatcher_shape() {
         assert_eq!(
             hyprland_focus_expression(HYPRLAND_HERDR_SELECTOR),
@@ -1884,14 +1912,7 @@ mod tests {
                     ("pane.focus", json!({"pane_id":"p1"})),
                 ],
             ),
-            (
-                PadEvent::Act(11),
-                2,
-                vec![
-                    ("pane.current", json!({})),
-                    ("pane.send_keys", json!({"pane_id":"p0","keys":["enter"]})),
-                ],
-            ),
+            (PadEvent::Act(11), 0, vec![]),
             (
                 PadEvent::Act(12),
                 2,

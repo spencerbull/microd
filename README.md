@@ -111,15 +111,19 @@ Controls:
 | `ACT06` | send `enter` to the focused pane (approve) |
 | `ACT07` | send `esc` to the focused pane (deny/interrupt) |
 | `ACT08` | jump to the next **blocked** agent |
-| mic key `ACT10` | optional Omarchy/Voxtype push-to-talk with `--voxtype`; otherwise unmapped |
-| key next to mic `ACT11`/`ACT12` | send `enter` to the focused pane |
+| mic key `ACT10` | optional Omarchy/Voxtype push-to-talk with `--voxtype`; release types the transcription without submitting |
+| key next to mic `ACT12` | send `enter` to the focused pane |
 | joystick left/right | previous/next tab in the focused workspace |
 | joystick up/down | previous/next workspace |
 
 The microphone key uses the computer's microphone; the Codex Micro itself
 only sends press/release events. On Omarchy, install and enable Dictation
 (Voxtype) first, then start the bridge with `--voxtype`. The user service
-records ownership in its private state
+disables Voxtype's automatic and spoken-word submission modes for each Codex
+Micro recording. It also ignores the companion `ACT11` event observed when
+the mic is pressed, leaving the adjacent `ACT12` Enter key as the explicit
+send action. These behaviors do not change global Voxtype preferences. The
+bridge records ownership in its private state
 directory before starting capture and runs an ownership-aware
 `voxtype record stop` on normal exit, crash restart, or forced termination,
 without stopping a recording it did not start.
