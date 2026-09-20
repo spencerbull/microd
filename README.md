@@ -75,6 +75,11 @@ Connects to microd's socket and herdr's JSON API socket
 
 The six Agent Keys mirror up to six herdr agents:
 
+The bridge polls Herdr's shared `agent.order.get` setting with each state
+refresh. `grouped` preserves Herdr's workspace order, while `priority` places
+blocked, ready-for-review, and working agents ahead of idle agents using the
+same state-transition ordering as Herdr's Agents view.
+
 | herdr status | light |
 |---|---|
 | working | breathing blue |
@@ -176,16 +181,23 @@ Build and install the binaries and user units without `sudo`:
 cargo build --release --workspace
 install -Dm755 target/release/microd ~/.local/bin/microd
 install -Dm755 target/release/herdr-bridge ~/.local/bin/herdr-bridge
+install -Dm755 scripts/herdr-micro ~/.local/bin/herdr-micro
 install -Dm644 systemd/microd.service ~/.config/systemd/user/microd.service
 install -Dm644 systemd/herdr-bridge.service ~/.config/systemd/user/herdr-bridge.service
 systemctl --user daemon-reload
 systemctl --user enable --now herdr-bridge.service
+herdr-micro  # Ghostty client with a stable app ID; attaches to the existing session
 ```
 
 The bridge pulls in `microd.service`, waits for Herdr's default session socket,
 and restarts after a Bluetooth or Herdr disconnect. On Hyprland it also uses
 the compositor's supported focus dispatcher to bring the terminal window
-titled `herdr` to the foreground after pane, tab, or workspace navigation.
+with app ID `dev.planeshift.herdr-micro` to the foreground after pane, tab,
+or workspace navigation, then verifies its compositor address. Launch the
+local session using `herdr-micro`; workspace titles can change freely.
+If zero or multiple windows match, navigation reports an actionable error.
+For multiple local sessions, give each launcher and bridge the same unique
+`HERDR_MICRO_WINDOW_CLASS` environment value.
 Logs are available with `journalctl --user -u microd -u herdr-bridge`.
 
 The packaged unit leaves Voxtype disabled so it also works on Linux systems

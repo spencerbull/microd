@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Attach to Herdr with a stable app ID for Codex Micro window activation.
+set -euo pipefail
+exec env -u HERDR_ENV ghostty \
+  --class="${HERDR_MICRO_WINDOW_CLASS:-dev.planeshift.herdr-micro}" \
+  --gtk-single-instance=false -e herdr "$@"
