@@ -75,10 +75,39 @@ Connects to microd's socket and herdr's JSON API socket
 
 The six Agent Keys mirror up to six herdr agents:
 
-The bridge polls Herdr's shared `agent.order.get` setting with each state
-refresh. `grouped` preserves Herdr's workspace order, while `priority` places
-blocked, ready-for-review, and working agents ahead of idle agents using the
-same state-transition ordering as Herdr's Agents view.
+`--order auto` (the default) follows Herdr 0.8.2's `agent.order.get` setting
+on each state refresh. Herdr 0.9.1 removed that API: auto then reads the local
+Herdr config's `ui.agent_panel_sort` (`spaces`, alias `workspaces`, or
+`priority`; default `spaces`) and the persisted client-shell sort preference.
+The preference takes precedence, and both files are reread each refresh so a
+persisted grouped/priority toggle takes effect without restarting the bridge.
+Use `--order grouped` or `--order priority` to override automatic selection.
+
+Grouped order preserves the API's workspace/tab/pane order. Priority uses raw
+Herdr status: blocked, done, working, idle, then unknown, with the most recent
+`state_change_seq` first within each status. LED review latches do not change
+the key order. Keys and dial navigation use the first six agents in that order.
+
+The local adapter targets Herdr 0.9.1 release builds. Config comes from
+`HERDR_CONFIG_PATH`, otherwise `$XDG_CONFIG_HOME/herdr/config.toml` or
+`~/.config/herdr/config.toml`. Preferences live under
+`$XDG_STATE_HOME/herdr/client-shell/` or `~/.local/state/herdr/client-shell/`;
+the filename is `local-<16-digit FNV-1a hash>.json` of the **client protocol
+socket path**, normally `herdr-client.sock` beside the API socket. An explicit
+bridge `--socket` or `HERDR_SOCKET_PATH` derives that client socket and takes
+precedence over `HERDR_CLIENT_SOCKET_PATH`; otherwise the legacy client-only
+override is honored. The config override does not relocate preferences.
+Without HOME/XDG paths, Herdr's temporary-directory fallbacks apply.
+
+Preference files are an optional, version-specific adapter, not a public
+Herdr API. Missing files use the configured/default order; malformed present
+settings are reported as errors (startup fails; later refreshes retain the
+last valid mapping). API failures other than the removed order method are
+not treated as a signal to use local settings. The bridge must share the
+local client's configuration environment. Custom agent views, remote or
+multi-machine client views, and another client's in-memory ordering cannot
+be inferred from this local API; use an explicit order when auto cannot
+represent the intended view.
 
 | herdr status | light |
 |---|---|

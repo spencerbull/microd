@@ -23,6 +23,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod order;
+use order::{OrderSelection, OrderSettings};
+
 const SLOTS: usize = 6;
 const LIGHT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -32,6 +35,9 @@ struct Cli {
     /// Path to the herdr API socket (default: $HERDR_SOCKET_PATH or ~/.config/herdr/herdr.sock)
     #[arg(long)]
     socket: Option<PathBuf>,
+    /// Agent Key ordering: auto follows legacy API or local Herdr client settings
+    #[arg(long, value_enum, default_value = "auto")]
+    order: OrderSelection,
     /// Path to microd (default: $MICROD_SOCKET, then $XDG_RUNTIME_DIR/microd/microd.sock)
     #[arg(long)]
     hub: Option<PathBuf>,
@@ -316,7 +322,9 @@ fn main() -> Result<()> {
     if cli.cleanup_dictation {
         return cleanup_owned_dictation();
     }
+    let api_socket_override = cli.socket.is_some() || std::env::var("HERDR_SOCKET_PATH").is_ok();
     let herdr_socket = cli.socket.unwrap_or_else(default_herdr_socket);
+    let order = OrderSettings::from_env(cli.order, &herdr_socket, api_socket_override);
     let hub_socket = cli.hub.unwrap_or_else(default_hub_socket);
 
     // microd connection: reader thread decodes pad events; the write half
@@ -338,7 +346,7 @@ fn main() -> Result<()> {
     let mut line = String::new();
     let mut last_reconcile = Instant::now();
 
-    let initial_state = wait_reconcile(&herdr_socket, &mut slots);
+    let initial_state = wait_reconcile(&herdr_socket, &mut slots, &order)?;
     let mut agent_panes = initial_state.agent_panes;
     let mut focused_pane_id = initial_state.focused_pane_id;
     let mut lines = subscribe(&herdr_socket, &agent_panes)?;
@@ -383,7 +391,9 @@ fn main() -> Result<()> {
             if let Err(e) = result {
                 eprintln!("{action:?} failed: {e:#}");
                 // A dead pane means our slot state is stale; rebuild it.
-                need_reconcile |= format!("{e:#}").contains("pane_not_found");
+                need_reconcile |= e
+                    .downcast_ref::<HerdrApiError>()
+                    .is_some_and(|error| error.code == "pane_not_found");
             }
         }
         render(
@@ -395,7 +405,7 @@ fn main() -> Result<()> {
             &mut rendered,
         )?;
         if need_reconcile {
-            if let Ok(current) = reconcile(&herdr_socket, &mut slots) {
+            if let Ok(current) = reconcile(&herdr_socket, &mut slots, &order) {
                 acknowledge_focus_transition(
                     &mut slots,
                     &mut focused_pane_id,
@@ -423,7 +433,7 @@ fn main() -> Result<()> {
                     continue;
                 };
                 if msg.get("event").is_some() {
-                    match reconcile(&herdr_socket, &mut slots) {
+                    match reconcile(&herdr_socket, &mut slots, &order) {
                         Ok(current) => {
                             acknowledge_focus_transition(
                                 &mut slots,
@@ -453,7 +463,7 @@ fn main() -> Result<()> {
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 if last_reconcile.elapsed() >= Duration::from_secs(5) {
-                    match reconcile(&herdr_socket, &mut slots) {
+                    match reconcile(&herdr_socket, &mut slots, &order) {
                         Ok(current) => {
                             acknowledge_focus_transition(
                                 &mut slots,
@@ -567,12 +577,19 @@ fn subscribe(socket: &PathBuf, agent_panes: &BTreeSet<String>) -> Result<BufRead
     Ok(lines)
 }
 
-fn wait_reconcile(socket: &PathBuf, slots: &mut [Option<Slot>; SLOTS]) -> ReconciledState {
+fn wait_reconcile(
+    socket: &PathBuf,
+    slots: &mut [Option<Slot>; SLOTS],
+    order: &OrderSettings,
+) -> Result<ReconciledState> {
     let mut waiting = false;
     loop {
-        match reconcile(socket, slots) {
-            Ok(agent_panes) => return agent_panes,
+        match reconcile(socket, slots, order) {
+            Ok(agent_panes) => return Ok(agent_panes),
             Err(e) => {
+                if e.is::<order::InvalidOrderSettings>() {
+                    return Err(e);
+                }
                 if !waiting {
                     println!("waiting for herdr state at {} ({e:#})", socket.display());
                     waiting = true;
@@ -847,6 +864,25 @@ fn one_shot(socket: &PathBuf, msg: &Value) -> Result<()> {
     one_shot_response(socket, msg).map(drop)
 }
 
+#[derive(Debug)]
+struct HerdrApiError {
+    method: String,
+    code: String,
+    message: String,
+}
+
+impl std::fmt::Display for HerdrApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "herdr {} error ({}): {}",
+            self.method, self.code, self.message
+        )
+    }
+}
+
+impl std::error::Error for HerdrApiError {}
+
 fn one_shot_response(socket: &PathBuf, msg: &Value) -> Result<Value> {
     let mut stream = UnixStream::connect(socket)?;
     send_line(&mut stream, msg)?;
@@ -854,8 +890,25 @@ fn one_shot_response(socket: &PathBuf, msg: &Value) -> Result<Value> {
     let mut resp = String::new();
     BufReader::new(stream).read_line(&mut resp)?;
     let value: Value = serde_json::from_str(&resp).context("parse herdr response")?;
-    if value.get("error").is_some() {
-        anyhow::bail!("herdr error: {}", resp.trim());
+    if let Some(error) = value.get("error") {
+        return Err(HerdrApiError {
+            method: msg
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            code: error
+                .get("code")
+                .and_then(Value::as_str)
+                .context("malformed Herdr error code")?
+                .to_string(),
+            message: error
+                .get("message")
+                .and_then(Value::as_str)
+                .context("malformed Herdr error message")?
+                .to_string(),
+        }
+        .into());
     }
     Ok(value)
 }
@@ -973,24 +1026,14 @@ fn parse_agent_order(response: &Value) -> Result<AgentOrderMode> {
     }
 }
 
-fn priority_rank(agent: &Value, previous: &[Option<Slot>; SLOTS]) -> u8 {
-    let pane_id = agent.get("pane_id").and_then(Value::as_str);
-    let previous = pane_id.and_then(|pane_id| {
-        previous
-            .iter()
-            .flatten()
-            .find(|slot| slot.pane_id == pane_id)
-    });
+fn priority_rank(agent: &Value) -> u8 {
     let status = agent
         .get("agent_status")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let review_ready = status == "done"
-        || (status == "idle"
-            && previous.is_some_and(|slot| slot.status == "working" || slot.review_ready));
     match status {
         "blocked" => 0,
-        _ if review_ready => 1,
+        "done" => 1,
         "working" => 2,
         "idle" => 3,
         _ => 4,
@@ -1016,7 +1059,7 @@ fn rebuild_slots_in_live_order(
     if order == AgentOrderMode::Priority {
         live.sort_by_key(|agent| {
             (
-                priority_rank(agent, &previous),
+                priority_rank(agent),
                 Reverse(
                     agent
                         .get("state_change_seq")
@@ -1053,13 +1096,15 @@ fn rebuild_slots_in_live_order(
 /// registered agents (agent.list, validated against panes that still exist —
 /// the registry can hold stale records for panes removed via tab/workspace
 /// close) and panes with a detected agent, which don't appear in agent.list.
-fn reconcile(socket: &PathBuf, slots: &mut [Option<Slot>; SLOTS]) -> Result<ReconciledState> {
+fn reconcile(
+    socket: &PathBuf,
+    slots: &mut [Option<Slot>; SLOTS],
+    order: &OrderSettings,
+) -> Result<ReconciledState> {
     let fetch = |method: &str| {
         one_shot_response(socket, &json!({"id": "r", "method": method, "params": {}}))
     };
-    let order = fetch("agent.order.get")
-        .context("read Herdr agent order")
-        .and_then(|response| parse_agent_order(&response))?;
+    let order = order.resolve(socket)?;
     let agents = fetch("agent.list").context("list herdr agents")?;
     let panes = fetch("pane.list").context("list herdr panes")?;
     let pane_records: Vec<&Value> = panes
@@ -1809,7 +1854,12 @@ mod tests {
             }
         });
         let mut slots = [Some(slot("old", "done")), None, None, None, None, None];
-        let state = reconcile(&path, &mut slots).unwrap();
+        let state = reconcile(
+            &path,
+            &mut slots,
+            &OrderSettings::from_env(OrderSelection::Auto, &path, true),
+        )
+        .unwrap();
         assert_eq!(
             state.agent_panes,
             BTreeSet::from(["detected".to_string(), "live".to_string()])
@@ -1866,9 +1916,19 @@ mod tests {
         });
         let mut slots: [Option<Slot>; SLOTS] = Default::default();
 
-        reconcile(&path, &mut slots).unwrap();
+        reconcile(
+            &path,
+            &mut slots,
+            &OrderSettings::from_env(OrderSelection::Auto, &path, true),
+        )
+        .unwrap();
         slots[0].as_mut().unwrap().review_ready = true;
-        reconcile(&path, &mut slots).unwrap();
+        reconcile(
+            &path,
+            &mut slots,
+            &OrderSettings::from_env(OrderSelection::Auto, &path, true),
+        )
+        .unwrap();
 
         assert_eq!(
             slots
@@ -1925,7 +1985,7 @@ mod tests {
     }
 
     #[test]
-    fn priority_order_promotes_a_new_review_ready_transition() {
+    fn priority_order_keeps_review_latches_separate_from_raw_status() {
         let mut slots = [
             Some(slot("finishing", "working")),
             None,
@@ -1949,8 +2009,48 @@ mod tests {
 
         rebuild_slots_in_live_order(&mut slots, &[&idle, &finishing], AgentOrderMode::Priority);
 
-        assert_eq!(slots[0].as_ref().unwrap().pane_id, "finishing");
-        assert!(slots[0].as_ref().unwrap().review_ready);
+        assert_eq!(slots[0].as_ref().unwrap().pane_id, "idle");
+        assert_eq!(slots[1].as_ref().unwrap().pane_id, "finishing");
+        assert!(slots[1].as_ref().unwrap().review_ready);
+    }
+
+    #[test]
+    fn priority_order_uses_raw_status_and_keeps_equal_sequences_stable() {
+        let agents = [
+            json!({"pane_id":"unknown","agent_status":"unknown","state_change_seq":u64::MAX}),
+            json!({"pane_id":"idle","agent_status":"idle","state_change_seq":100}),
+            json!({"pane_id":"working-first","agent_status":"working"}),
+            json!({"pane_id":"done","agent_status":"done"}),
+            json!({"pane_id":"blocked","agent_status":"blocked"}),
+            json!({"pane_id":"working-second","agent_status":"working","state_change_seq":0}),
+        ];
+        let mut idle = slot("idle", "idle");
+        idle.review_ready = true;
+        let mut done = slot("done", "done");
+        done.review_ready = false;
+        let mut slots = [Some(idle), Some(done), None, None, None, None];
+        rebuild_slots_in_live_order(
+            &mut slots,
+            &agents.iter().collect::<Vec<_>>(),
+            AgentOrderMode::Priority,
+        );
+        assert_eq!(
+            slots
+                .iter()
+                .flatten()
+                .map(|slot| slot.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "blocked",
+                "done",
+                "working-first",
+                "working-second",
+                "idle",
+                "unknown"
+            ]
+        );
+        assert!(!slots[1].as_ref().unwrap().review_ready);
+        assert!(slots[4].as_ref().unwrap().review_ready);
     }
 
     #[test]
