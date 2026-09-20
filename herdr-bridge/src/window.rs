@@ -2,7 +2,9 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 #[cfg(not(test))]
@@ -42,7 +44,8 @@ impl Desktop for SystemDesktop {
         } else {
             command.env_remove("HYPRLAND_INSTANCE_SIGNATURE");
         }
-        let output = run_bounded(command, deadline)?;
+        let output = run_bounded(command, deadline)
+            .with_context(|| format!("hyprctl {}", args.join(" ")))?;
         if !output.status.success() {
             anyhow::bail!(
                 "Hyprland command failed: {}",
@@ -62,43 +65,62 @@ impl Desktop for SystemDesktop {
 }
 
 fn run_bounded(mut command: Command, deadline: Instant) -> Result<Output> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if Instant::now() >= deadline {
+        anyhow::bail!("Hyprland command exceeded activation deadline");
+    }
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
     let mut child = command.spawn().context("spawn Hyprland command")?;
-    // Drain while the child runs: a large `clients` response can fill a pipe.
     let mut stdout = child.stdout.take().context("capture Hyprland stdout")?;
     let mut stderr = child.stderr.take().context("capture Hyprland stderr")?;
-    let out = std::thread::spawn(move || {
+    // Drain concurrently, but bound collection too: descendants can keep a
+    // pipe open after the direct child exits. Never join an unbounded reader.
+    let (out_tx, out_rx) = mpsc::channel();
+    let (err_tx, err_rx) = mpsc::channel();
+    std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
+        let result = stdout.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = out_tx.send(result);
     });
-    let err = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).map(|_| bytes)
+        let result = stderr.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = err_tx.send(result);
     });
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break Ok(status);
+    let result = (|| {
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("Hyprland command exceeded activation deadline");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let stdout = out_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .context("Hyprland stdout exceeded activation deadline")??;
+        let stderr = err_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .context("Hyprland stderr exceeded activation deadline")??;
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })();
+    if result.is_err() {
+        // This group was created solely for this command; never signal the
+        // bridge's or terminal's process group.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            break Err(anyhow::anyhow!(
-                "Hyprland command exceeded activation deadline"
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    let stdout = out
-        .join()
-        .map_err(|_| anyhow::anyhow!("Hyprland stdout reader failed"))??;
-    let stderr = err
-        .join()
-        .map_err(|_| anyhow::anyhow!("Hyprland stderr reader failed"))??;
-    Ok(Output {
-        status: status?,
-        stdout,
-        stderr,
-    })
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
 }
 
 fn instance(desktop: &mut impl Desktop, deadline: Instant) -> Result<String> {
@@ -291,6 +313,25 @@ mod tests {
         assert!(run_bounded(command, start + Duration::from_millis(25)).is_err());
         assert!(start.elapsed() < Duration::from_millis(500));
     }
+    #[test]
+    fn descendant_holding_output_cannot_extend_the_deadline() {
+        let start = Instant::now();
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10 & exit 0"]);
+        assert!(run_bounded(command, start + Duration::from_millis(50)).is_err());
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn expired_deadline_does_not_spawn() {
+        let mut command = Command::new("command-that-does-not-exist");
+        command.arg("ignored");
+        assert!(run_bounded(command, Instant::now())
+            .unwrap_err()
+            .to_string()
+            .contains("deadline"));
+    }
+
     #[test]
     fn large_output_does_not_deadlock_the_child() {
         let mut command = Command::new("sh");

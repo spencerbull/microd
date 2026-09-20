@@ -6,6 +6,7 @@ description = "Maps Codex Micro pad events (via microd) onto herdr agents, panes
 
 [dependencies]
 anyhow = "1"
+libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

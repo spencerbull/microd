@@ -211,6 +211,7 @@ cargo build --release --workspace
 install -Dm755 target/release/microd ~/.local/bin/microd
 install -Dm755 target/release/herdr-bridge ~/.local/bin/herdr-bridge
 install -Dm755 scripts/herdr-micro ~/.local/bin/herdr-micro
+install -Dm644 desktop/herdr-micro.desktop ~/.local/share/applications/herdr-micro.desktop
 install -Dm644 systemd/microd.service ~/.config/systemd/user/microd.service
 install -Dm644 systemd/herdr-bridge.service ~/.config/systemd/user/herdr-bridge.service
 systemctl --user daemon-reload
@@ -225,7 +226,9 @@ with app ID `dev.planeshift.herdr-micro` to the foreground after pane, tab,
 or workspace navigation, then verifies its compositor address. Launch the
 local session using `herdr-micro`; workspace titles can change freely.
 If zero or multiple windows match, navigation reports an actionable error.
-For multiple local sessions, give each launcher and bridge the same unique
+The launcher explicitly selects the default session and clears inherited Herdr
+socket variables. For a named session, set `HERDR_MICRO_SESSION` on the launcher,
+point the bridge at that session with `--socket`, and give both the same unique
 `HERDR_MICRO_WINDOW_CLASS` environment value.
 Logs are available with `journalctl --user -u microd -u herdr-bridge`.
 
@@ -341,3 +344,15 @@ status/version/light operations. Arbitrary raw commands are never retried.
 A one-shot input report that collides with a malformed firmware response can
 still be lost; USB-C is the strict-reliability transport until firmware fixes
 that Bluetooth race.
+
+## Compatibility verification
+
+Validated against Herdr 0.9.1. Run `cargo test --workspace --all-targets`, then
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+After a release build, `python3 scripts/validate-herdr.py --artifacts /tmp/micro-proof`
+starts an isolated real Herdr server and simulates pad events and LED replies.
+Add `--gui` on Hyprland/Ghostty to check actual window activation by compositor
+address. The harness stops only its own server and windows; it never connects
+to the physical pad. Hardware key presses and visible LED colors require a
+separate physical check. Linux CI runs the API harness against the checksum-pinned
+official Herdr 0.9.1 release; macOS runs the Rust suite.
