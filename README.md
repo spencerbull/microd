@@ -75,6 +75,40 @@ Connects to microd's socket and herdr's JSON API socket
 
 The six Agent Keys mirror up to six herdr agents:
 
+`--order auto` (the default) follows Herdr 0.8.2's `agent.order.get` setting
+on each state refresh. Herdr 0.9.1 removed that API: auto then reads the local
+Herdr config's `ui.agent_panel_sort` (`spaces`, alias `workspaces`, or
+`priority`; default `spaces`) and the persisted client-shell sort preference.
+The preference takes precedence, and both files are reread each refresh so a
+persisted grouped/priority toggle takes effect without restarting the bridge.
+Use `--order grouped` or `--order priority` to override automatic selection.
+
+Grouped order preserves the API's workspace/tab/pane order. Priority uses raw
+Herdr status: blocked, done, working, idle, then unknown, with the most recent
+`state_change_seq` first within each status. LED review latches do not change
+the key order. Keys and dial navigation use the first six agents in that order.
+
+The local adapter targets Herdr 0.9.1 release builds. Config comes from
+`HERDR_CONFIG_PATH`, otherwise `$XDG_CONFIG_HOME/herdr/config.toml` or
+`~/.config/herdr/config.toml`. Preferences live under
+`$XDG_STATE_HOME/herdr/client-shell/` or `~/.local/state/herdr/client-shell/`;
+the filename is `local-<16-digit FNV-1a hash>.json` of the **client protocol
+socket path**, normally `herdr-client.sock` beside the API socket. An explicit
+bridge `--socket` or `HERDR_SOCKET_PATH` derives that client socket and takes
+precedence over `HERDR_CLIENT_SOCKET_PATH`; otherwise the legacy client-only
+override is honored. The config override does not relocate preferences.
+Without HOME/XDG paths, Herdr's temporary-directory fallbacks apply.
+
+Preference files are an optional, version-specific adapter, not a public
+Herdr API. Missing files use the configured/default order; malformed present
+settings are reported as errors (startup fails; later refreshes retain the
+last valid mapping). API failures other than the removed order method are
+not treated as a signal to use local settings. The bridge must share the
+local client's configuration environment. Custom agent views, remote or
+multi-machine client views, and another client's in-memory ordering cannot
+be inferred from this local API; use an explicit order when auto cannot
+represent the intended view.
+
 | herdr status | light |
 |---|---|
 | working | breathing blue |
@@ -176,16 +210,26 @@ Build and install the binaries and user units without `sudo`:
 cargo build --release --workspace
 install -Dm755 target/release/microd ~/.local/bin/microd
 install -Dm755 target/release/herdr-bridge ~/.local/bin/herdr-bridge
+install -Dm755 scripts/herdr-micro ~/.local/bin/herdr-micro
+install -Dm644 desktop/herdr-micro.desktop ~/.local/share/applications/herdr-micro.desktop
 install -Dm644 systemd/microd.service ~/.config/systemd/user/microd.service
 install -Dm644 systemd/herdr-bridge.service ~/.config/systemd/user/herdr-bridge.service
 systemctl --user daemon-reload
 systemctl --user enable --now herdr-bridge.service
+herdr-micro  # Ghostty client with a stable app ID; attaches to the existing session
 ```
 
 The bridge pulls in `microd.service`, waits for Herdr's default session socket,
 and restarts after a Bluetooth or Herdr disconnect. On Hyprland it also uses
 the compositor's supported focus dispatcher to bring the terminal window
-titled `herdr` to the foreground after pane, tab, or workspace navigation.
+with app ID `dev.planeshift.herdr-micro` to the foreground after pane, tab,
+or workspace navigation, then verifies its compositor address. Launch the
+local session using `herdr-micro`; workspace titles can change freely.
+If zero or multiple windows match, navigation reports an actionable error.
+The launcher explicitly selects the default session and clears inherited Herdr
+socket variables. For a named session, set `HERDR_MICRO_SESSION` on the launcher,
+point the bridge at that session with `--socket`, and give both the same unique
+`HERDR_MICRO_WINDOW_CLASS` environment value.
 Logs are available with `journalctl --user -u microd -u herdr-bridge`.
 
 The packaged unit leaves Voxtype disabled so it also works on Linux systems
@@ -300,3 +344,15 @@ status/version/light operations. Arbitrary raw commands are never retried.
 A one-shot input report that collides with a malformed firmware response can
 still be lost; USB-C is the strict-reliability transport until firmware fixes
 that Bluetooth race.
+
+## Compatibility verification
+
+Validated against Herdr 0.9.1. Run `cargo test --workspace --all-targets`, then
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+After a release build, `python3 scripts/validate-herdr.py --artifacts /tmp/micro-proof`
+starts an isolated real Herdr server and simulates pad events and LED replies.
+Add `--gui` on Hyprland/Ghostty to check actual window activation by compositor
+address. The harness stops only its own server and windows; it never connects
+to the physical pad. Hardware key presses and visible LED colors require a
+separate physical check. Linux CI runs the API harness against the checksum-pinned
+official Herdr 0.9.1 release; macOS runs the Rust suite.

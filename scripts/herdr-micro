@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Attach to Herdr with a stable app ID for Codex Micro window activation.
+set -euo pipefail
+session="${HERDR_MICRO_SESSION:-default}"
+exec env -u HERDR_ENV -u HERDR_SESSION -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH ghostty \
+  --class="${HERDR_MICRO_WINDOW_CLASS:-dev.planeshift.herdr-micro}" \
+  --gtk-single-instance=false -e herdr --session "$session" "$@"

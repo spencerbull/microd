@@ -11,17 +11,22 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{json, Value};
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::Command;
+
+mod window;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod order;
+use order::{OrderSelection, OrderSettings};
+
 const SLOTS: usize = 6;
-const HYPRLAND_HERDR_SELECTOR: &str = "title:^herdr$";
 const LIGHT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
@@ -30,6 +35,9 @@ struct Cli {
     /// Path to the herdr API socket (default: $HERDR_SOCKET_PATH or ~/.config/herdr/herdr.sock)
     #[arg(long)]
     socket: Option<PathBuf>,
+    /// Agent Key ordering: auto follows legacy API or local Herdr client settings
+    #[arg(long, value_enum, default_value = "auto")]
+    order: OrderSelection,
     /// Path to microd (default: $MICROD_SOCKET, then $XDG_RUNTIME_DIR/microd/microd.sock)
     #[arg(long)]
     hub: Option<PathBuf>,
@@ -103,6 +111,12 @@ struct RenderedFrame {
 struct ReconciledState {
     agent_panes: BTreeSet<String>,
     focused_pane_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentOrderMode {
+    Grouped,
+    Priority,
 }
 
 struct DictationSession {
@@ -308,7 +322,9 @@ fn main() -> Result<()> {
     if cli.cleanup_dictation {
         return cleanup_owned_dictation();
     }
+    let api_socket_override = cli.socket.is_some() || std::env::var("HERDR_SOCKET_PATH").is_ok();
     let herdr_socket = cli.socket.unwrap_or_else(default_herdr_socket);
+    let order = OrderSettings::from_env(cli.order, &herdr_socket, api_socket_override);
     let hub_socket = cli.hub.unwrap_or_else(default_hub_socket);
 
     // microd connection: reader thread decodes pad events; the write half
@@ -330,7 +346,7 @@ fn main() -> Result<()> {
     let mut line = String::new();
     let mut last_reconcile = Instant::now();
 
-    let initial_state = wait_reconcile(&herdr_socket, &mut slots);
+    let initial_state = wait_reconcile(&herdr_socket, &mut slots, &order)?;
     let mut agent_panes = initial_state.agent_panes;
     let mut focused_pane_id = initial_state.focused_pane_id;
     let mut lines = subscribe(&herdr_socket, &agent_panes)?;
@@ -375,7 +391,9 @@ fn main() -> Result<()> {
             if let Err(e) = result {
                 eprintln!("{action:?} failed: {e:#}");
                 // A dead pane means our slot state is stale; rebuild it.
-                need_reconcile |= format!("{e:#}").contains("pane_not_found");
+                need_reconcile |= e
+                    .downcast_ref::<HerdrApiError>()
+                    .is_some_and(|error| error.code == "pane_not_found");
             }
         }
         render(
@@ -387,7 +405,7 @@ fn main() -> Result<()> {
             &mut rendered,
         )?;
         if need_reconcile {
-            if let Ok(current) = reconcile(&herdr_socket, &mut slots) {
+            if let Ok(current) = reconcile(&herdr_socket, &mut slots, &order) {
                 acknowledge_focus_transition(
                     &mut slots,
                     &mut focused_pane_id,
@@ -415,7 +433,7 @@ fn main() -> Result<()> {
                     continue;
                 };
                 if msg.get("event").is_some() {
-                    match reconcile(&herdr_socket, &mut slots) {
+                    match reconcile(&herdr_socket, &mut slots, &order) {
                         Ok(current) => {
                             acknowledge_focus_transition(
                                 &mut slots,
@@ -445,7 +463,7 @@ fn main() -> Result<()> {
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 if last_reconcile.elapsed() >= Duration::from_secs(5) {
-                    match reconcile(&herdr_socket, &mut slots) {
+                    match reconcile(&herdr_socket, &mut slots, &order) {
                         Ok(current) => {
                             acknowledge_focus_transition(
                                 &mut slots,
@@ -559,12 +577,19 @@ fn subscribe(socket: &PathBuf, agent_panes: &BTreeSet<String>) -> Result<BufRead
     Ok(lines)
 }
 
-fn wait_reconcile(socket: &PathBuf, slots: &mut [Option<Slot>; SLOTS]) -> ReconciledState {
+fn wait_reconcile(
+    socket: &PathBuf,
+    slots: &mut [Option<Slot>; SLOTS],
+    order: &OrderSettings,
+) -> Result<ReconciledState> {
     let mut waiting = false;
     loop {
-        match reconcile(socket, slots) {
-            Ok(agent_panes) => return agent_panes,
+        match reconcile(socket, slots, order) {
+            Ok(agent_panes) => return Ok(agent_panes),
             Err(e) => {
+                if e.is::<order::InvalidOrderSettings>() {
+                    return Err(e);
+                }
                 if !waiting {
                     println!("waiting for herdr state at {} ({e:#})", socket.display());
                     waiting = true;
@@ -839,6 +864,25 @@ fn one_shot(socket: &PathBuf, msg: &Value) -> Result<()> {
     one_shot_response(socket, msg).map(drop)
 }
 
+#[derive(Debug)]
+struct HerdrApiError {
+    method: String,
+    code: String,
+    message: String,
+}
+
+impl std::fmt::Display for HerdrApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "herdr {} error ({}): {}",
+            self.method, self.code, self.message
+        )
+    }
+}
+
+impl std::error::Error for HerdrApiError {}
+
 fn one_shot_response(socket: &PathBuf, msg: &Value) -> Result<Value> {
     let mut stream = UnixStream::connect(socket)?;
     send_line(&mut stream, msg)?;
@@ -846,8 +890,25 @@ fn one_shot_response(socket: &PathBuf, msg: &Value) -> Result<Value> {
     let mut resp = String::new();
     BufReader::new(stream).read_line(&mut resp)?;
     let value: Value = serde_json::from_str(&resp).context("parse herdr response")?;
-    if value.get("error").is_some() {
-        anyhow::bail!("herdr error: {}", resp.trim());
+    if let Some(error) = value.get("error") {
+        return Err(HerdrApiError {
+            method: msg
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            code: error
+                .get("code")
+                .and_then(Value::as_str)
+                .context("malformed Herdr error code")?
+                .to_string(),
+            message: error
+                .get("message")
+                .and_then(Value::as_str)
+                .context("malformed Herdr error message")?
+                .to_string(),
+        }
+        .into());
     }
     Ok(value)
 }
@@ -951,7 +1012,39 @@ fn acknowledge_focus_transition(
         .is_some_and(|pane_id| acknowledge_review_ready(slots, pane_id, "Herdr pane focus"))
 }
 
-fn rebuild_slots_in_live_order(slots: &mut [Option<Slot>; SLOTS], live: &[&Value]) {
+fn parse_agent_order(response: &Value) -> Result<AgentOrderMode> {
+    let result = response
+        .get("result")
+        .context("agent.order.get response had no result")?;
+    if result.get("type").and_then(Value::as_str) != Some("agent_order") {
+        anyhow::bail!("unexpected agent.order.get result: {result}");
+    }
+    match result.get("order").and_then(Value::as_str) {
+        Some("grouped") => Ok(AgentOrderMode::Grouped),
+        Some("priority") => Ok(AgentOrderMode::Priority),
+        _ => anyhow::bail!("unexpected Herdr agent order: {result}"),
+    }
+}
+
+fn priority_rank(agent: &Value) -> u8 {
+    let status = agent
+        .get("agent_status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    match status {
+        "blocked" => 0,
+        "done" => 1,
+        "working" => 2,
+        "idle" => 3,
+        _ => 4,
+    }
+}
+
+fn rebuild_slots_in_live_order(
+    slots: &mut [Option<Slot>; SLOTS],
+    live: &[&Value],
+    order: AgentOrderMode,
+) {
     let previous = slots.clone();
     for slot in previous.iter().flatten() {
         let still_live = live
@@ -960,6 +1053,21 @@ fn rebuild_slots_in_live_order(slots: &mut [Option<Slot>; SLOTS], live: &[&Value
         if !still_live {
             println!("agent gone: {} ({})", slot.label, slot.pane_id);
         }
+    }
+
+    let mut live = live.to_vec();
+    if order == AgentOrderMode::Priority {
+        live.sort_by_key(|agent| {
+            (
+                priority_rank(agent),
+                Reverse(
+                    agent
+                        .get("state_change_seq")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                ),
+            )
+        });
     }
 
     let mut ordered: [Option<Slot>; SLOTS] = Default::default();
@@ -988,10 +1096,15 @@ fn rebuild_slots_in_live_order(slots: &mut [Option<Slot>; SLOTS], live: &[&Value
 /// registered agents (agent.list, validated against panes that still exist —
 /// the registry can hold stale records for panes removed via tab/workspace
 /// close) and panes with a detected agent, which don't appear in agent.list.
-fn reconcile(socket: &PathBuf, slots: &mut [Option<Slot>; SLOTS]) -> Result<ReconciledState> {
+fn reconcile(
+    socket: &PathBuf,
+    slots: &mut [Option<Slot>; SLOTS],
+    order: &OrderSettings,
+) -> Result<ReconciledState> {
     let fetch = |method: &str| {
         one_shot_response(socket, &json!({"id": "r", "method": method, "params": {}}))
     };
+    let order = order.resolve(socket)?;
     let agents = fetch("agent.list").context("list herdr agents")?;
     let panes = fetch("pane.list").context("list herdr panes")?;
     let pane_records: Vec<&Value> = panes
@@ -1039,7 +1152,7 @@ fn reconcile(socket: &PathBuf, slots: &mut [Option<Slot>; SLOTS]) -> Result<Reco
         .find(|pane| pane.get("focused").and_then(Value::as_bool) == Some(true))
         .and_then(|pane| pane.get("pane_id").and_then(Value::as_str))
         .map(str::to_string);
-    rebuild_slots_in_live_order(slots, &live);
+    rebuild_slots_in_live_order(slots, &live, order);
     Ok(ReconciledState {
         agent_panes,
         focused_pane_id,
@@ -1098,184 +1211,15 @@ fn focus_pane(socket: &PathBuf, pane_id: &str) -> Result<()> {
         socket,
         &json!({"id": "focus", "method": "pane.focus", "params": {"pane_id": pane_id}}),
     )?;
-    activate_herdr_window_best_effort();
+    activate_herdr_window(socket)?;
     Ok(())
 }
 
-fn activate_herdr_window_best_effort() {
+fn activate_herdr_window(socket: &PathBuf) -> Result<()> {
     #[cfg(not(test))]
-    if let Err(error) = activate_herdr_window() {
-        eprintln!("could not activate Herdr window: {error:#}");
-    }
-}
-
-fn hyprland_focus_expression(selector: &str) -> String {
-    let selector = selector.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("hl.dsp.focus({{ window = \"{selector}\" }})")
-}
-
-#[cfg(not(test))]
-fn activate_herdr_window() -> Result<()> {
-    activate_herdr_window_with(&mut CommandHyprlandIpc, Duration::from_millis(200))
-}
-
-#[derive(Debug)]
-struct HyprlandOutput {
-    success: bool,
-    stdout: String,
-    stderr: String,
-}
-
-trait HyprlandIpc {
-    fn wayland_display(&self) -> Option<String>;
-    fn run(
-        &mut self,
-        args: &[&str],
-        signature: Option<&str>,
-        deadline: Instant,
-    ) -> Result<HyprlandOutput>;
-}
-
-#[cfg(not(test))]
-struct CommandHyprlandIpc;
-
-#[cfg(not(test))]
-impl HyprlandIpc for CommandHyprlandIpc {
-    fn wayland_display(&self) -> Option<String> {
-        std::env::var("WAYLAND_DISPLAY").ok()
-    }
-
-    fn run(
-        &mut self,
-        args: &[&str],
-        signature: Option<&str>,
-        deadline: Instant,
-    ) -> Result<HyprlandOutput> {
-        let mut command = Command::new("hyprctl");
-        command.args(args);
-        match signature {
-            Some(signature) => {
-                command.env("HYPRLAND_INSTANCE_SIGNATURE", signature);
-            }
-            None => {
-                // Instance discovery must also work when the bridge started
-                // before Hyprland imported its environment into systemd.
-                command.env_remove("HYPRLAND_INSTANCE_SIGNATURE");
-            }
-        }
-        let output = run_bounded_command(command, deadline)?;
-        Ok(HyprlandOutput {
-            success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
-    }
-}
-
-fn run_bounded_command(mut command: Command, deadline: Instant) -> Result<Output> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().context("spawn Hyprland IPC command")?;
-    loop {
-        if child
-            .try_wait()
-            .context("poll Hyprland IPC command")?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .context("collect Hyprland IPC output");
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("Hyprland IPC command exceeded activation deadline");
-        }
-        std::thread::sleep(remaining.min(Duration::from_millis(5)));
-    }
-}
-
-fn hyprland_instance_signature(ipc: &mut impl HyprlandIpc, deadline: Instant) -> Result<String> {
-    let output = ipc
-        .run(&["instances", "-j"], None, deadline)
-        .context("discover running Hyprland instances")?;
-    if !output.success {
-        anyhow::bail!(
-            "Hyprland instance discovery failed: {}",
-            output.stderr.trim()
-        );
-    }
-    let instances: Value =
-        serde_json::from_str(&output.stdout).context("parse Hyprland instance list")?;
-    let instances = instances
-        .as_array()
-        .context("Hyprland instance list was not an array")?;
-    let display = ipc.wayland_display();
-    let candidates = instances.iter().filter(|instance| {
-        display.as_deref().is_none_or(|display| {
-            instance.get("wl_socket").and_then(Value::as_str) == Some(display)
-        })
-    });
-    candidates
-        .max_by_key(|instance| instance.get("time").and_then(Value::as_u64).unwrap_or(0))
-        .and_then(|instance| instance.get("instance").and_then(Value::as_str))
-        .map(str::to_string)
-        .context("no running Hyprland instance matched this Wayland display")
-}
-
-fn activate_herdr_window_with(ipc: &mut impl HyprlandIpc, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    let signature = hyprland_instance_signature(ipc, deadline)?;
-
-    let expression = hyprland_focus_expression(HYPRLAND_HERDR_SELECTOR);
-    let modern = ipc
-        .run(&["dispatch", &expression], Some(&signature), deadline)
-        .context("run Hyprland focus dispatcher")?;
-    if !modern.success {
-        // Hyprland before the Lua dispatcher API used the legacy
-        // `focuswindow` command. Keep that fallback for non-Omarchy users.
-        let legacy = ipc
-            .run(
-                &["dispatch", "focuswindow", HYPRLAND_HERDR_SELECTOR],
-                Some(&signature),
-                deadline,
-            )
-            .context("run legacy Hyprland focus dispatcher")?;
-        if !legacy.success {
-            anyhow::bail!(
-                "Hyprland rejected window activation: modern={}, legacy={}",
-                modern.stderr.trim(),
-                legacy.stderr.trim()
-            );
-        }
-    }
-
-    // Compositor focus changes can settle just after the dispatcher returns.
-    // Confirm the target before treating the button action as complete.
-    while Instant::now() < deadline {
-        let active = ipc
-            .run(&["-j", "activewindow"], Some(&signature), deadline)
-            .context("query active Hyprland window")?;
-        if active.success
-            && serde_json::from_str::<Value>(&active.stdout)
-                .ok()
-                .and_then(|window| {
-                    window
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .as_deref()
-                == Some("herdr")
-        {
-            return Ok(());
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if !remaining.is_zero() {
-            std::thread::sleep(remaining.min(Duration::from_millis(10)));
-        }
-    }
-    anyhow::bail!("Hyprland did not focus the Herdr window before the activation deadline")
+    window::activate()?;
+    let _ = socket;
+    Ok(())
 }
 
 fn focused_pane_id(socket: &PathBuf) -> Result<String> {
@@ -1317,7 +1261,7 @@ fn focus_workspace_by_index(socket: &PathBuf, idx: usize) -> Result<()> {
         socket,
         &json!({"id": "wsf", "method": "workspace.focus", "params": {"workspace_id": id}}),
     )?;
-    activate_herdr_window_best_effort();
+    activate_herdr_window(socket)?;
     Ok(())
 }
 
@@ -1406,7 +1350,7 @@ fn cycle_workspace(socket: &PathBuf, dir: i32) -> Result<()> {
         socket,
         &json!({"id": "wsf", "method": "workspace.focus", "params": {"workspace_id": id}}),
     )?;
-    activate_herdr_window_best_effort();
+    activate_herdr_window(socket)?;
     Ok(())
 }
 
@@ -1450,14 +1394,13 @@ fn cycle_tab(socket: &PathBuf, dir: i32) -> Result<()> {
         socket,
         &json!({"id": "tabf", "method": "tab.focus", "params": {"tab_id": id}}),
     )?;
-    activate_herdr_window_best_effort();
+    activate_herdr_window(socket)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
     use std::fs;
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1466,68 +1409,6 @@ mod tests {
     static NEXT_SOCKET: AtomicU64 = AtomicU64::new(1);
     type ExpectedRequest<'a> = (&'a str, Value);
     type ActionCase<'a> = (PadEvent, usize, Vec<ExpectedRequest<'a>>);
-
-    #[derive(Clone)]
-    struct FakeHyprlandReply {
-        success: bool,
-        stdout: &'static str,
-        stderr: &'static str,
-    }
-
-    struct FakeHyprlandIpc {
-        display: Option<String>,
-        replies: VecDeque<FakeHyprlandReply>,
-        calls: Vec<(Vec<String>, Option<String>)>,
-    }
-
-    impl FakeHyprlandIpc {
-        fn new(
-            display: Option<&str>,
-            replies: impl IntoIterator<Item = FakeHyprlandReply>,
-        ) -> Self {
-            Self {
-                display: display.map(str::to_string),
-                replies: replies.into_iter().collect(),
-                calls: Vec::new(),
-            }
-        }
-    }
-
-    impl HyprlandIpc for FakeHyprlandIpc {
-        fn wayland_display(&self) -> Option<String> {
-            self.display.clone()
-        }
-
-        fn run(
-            &mut self,
-            args: &[&str],
-            signature: Option<&str>,
-            _deadline: Instant,
-        ) -> Result<HyprlandOutput> {
-            self.calls.push((
-                args.iter().map(|arg| (*arg).to_string()).collect(),
-                signature.map(str::to_string),
-            ));
-            let reply = self.replies.pop_front().unwrap_or(FakeHyprlandReply {
-                success: true,
-                stdout: r#"{"title":"not-herdr"}"#,
-                stderr: "",
-            });
-            Ok(HyprlandOutput {
-                success: reply.success,
-                stdout: reply.stdout.to_string(),
-                stderr: reply.stderr.to_string(),
-            })
-        }
-    }
-
-    fn successful_reply(stdout: &'static str) -> FakeHyprlandReply {
-        FakeHyprlandReply {
-            success: true,
-            stdout,
-            stderr: "",
-        }
-    }
 
     fn socket_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1754,125 +1635,6 @@ mod tests {
     }
 
     #[test]
-    fn hyprland_activation_uses_the_current_lua_dispatcher_shape() {
-        assert_eq!(
-            hyprland_focus_expression(HYPRLAND_HERDR_SELECTOR),
-            "hl.dsp.focus({ window = \"title:^herdr$\" })"
-        );
-        assert_eq!(
-            hyprland_focus_expression("title:\"herdr\"\\test"),
-            "hl.dsp.focus({ window = \"title:\\\"herdr\\\"\\\\test\" })"
-        );
-    }
-
-    #[test]
-    fn hyprland_activation_discovers_the_current_instance_at_press_time() {
-        let mut ipc = FakeHyprlandIpc::new(
-            Some("wayland-1"),
-            [
-                successful_reply(
-                    r#"[
-                        {"instance":"older","time":1,"wl_socket":"wayland-1"},
-                        {"instance":"other-display","time":3,"wl_socket":"wayland-9"},
-                        {"instance":"current","time":2,"wl_socket":"wayland-1"}
-                    ]"#,
-                ),
-                successful_reply("ok"),
-                successful_reply(r#"{"title":"herdr"}"#),
-            ],
-        );
-
-        activate_herdr_window_with(&mut ipc, Duration::from_millis(100)).unwrap();
-
-        assert_eq!(
-            ipc.calls,
-            vec![
-                (vec!["instances".to_string(), "-j".to_string()], None),
-                (
-                    vec![
-                        "dispatch".to_string(),
-                        "hl.dsp.focus({ window = \"title:^herdr$\" })".to_string()
-                    ],
-                    Some("current".to_string())
-                ),
-                (
-                    vec!["-j".to_string(), "activewindow".to_string()],
-                    Some("current".to_string())
-                )
-            ]
-        );
-    }
-
-    #[test]
-    fn hyprland_activation_falls_back_to_the_legacy_dispatcher() {
-        let mut ipc = FakeHyprlandIpc::new(
-            None,
-            [
-                successful_reply(r#"[{"instance":"current","time":2,"wl_socket":"wayland-1"}]"#),
-                FakeHyprlandReply {
-                    success: false,
-                    stdout: "",
-                    stderr: "unknown dispatcher",
-                },
-                successful_reply("ok"),
-                successful_reply(r#"{"title":"herdr"}"#),
-            ],
-        );
-
-        activate_herdr_window_with(&mut ipc, Duration::from_millis(100)).unwrap();
-
-        assert_eq!(
-            ipc.calls[2],
-            (
-                vec![
-                    "dispatch".to_string(),
-                    "focuswindow".to_string(),
-                    HYPRLAND_HERDR_SELECTOR.to_string()
-                ],
-                Some("current".to_string())
-            )
-        );
-    }
-
-    #[test]
-    fn hyprland_activation_reports_a_dispatch_that_did_not_take_effect() {
-        let mut ipc = FakeHyprlandIpc::new(
-            Some("wayland-1"),
-            [
-                successful_reply(r#"[{"instance":"current","time":2,"wl_socket":"wayland-1"}]"#),
-                successful_reply("ok"),
-            ],
-        );
-
-        let error = activate_herdr_window_with(&mut ipc, Duration::from_millis(25)).unwrap_err();
-
-        assert!(
-            error.to_string().contains("did not focus the Herdr window"),
-            "{error:#}"
-        );
-        assert!(ipc.calls.len() >= 3);
-    }
-
-    #[test]
-    fn hyprland_subprocess_is_killed_at_the_shared_deadline() {
-        let started = Instant::now();
-        let mut command = Command::new("sleep");
-        command.arg("1");
-
-        let error = run_bounded_command(command, started + Duration::from_millis(25)).unwrap_err();
-
-        assert!(
-            error.to_string().contains("exceeded activation deadline"),
-            "{error:#}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "bounded command took {:?}",
-            started.elapsed()
-        );
-    }
-
-    #[test]
     fn blocked_focus_cycles_after_the_current_slot() {
         let slots = [
             Some(slot("p0", "blocked")),
@@ -2035,7 +1797,7 @@ mod tests {
         let p1 = json!({"pane_id":"p1","name":"codex","agent_status":"working"});
         let p3 = json!({"pane_id":"p3","name":"codex","agent_status":"blocked"});
 
-        rebuild_slots_in_live_order(&mut slots, &[&p2, &p1, &p3]);
+        rebuild_slots_in_live_order(&mut slots, &[&p2, &p1, &p3], AgentOrderMode::Grouped);
 
         assert_eq!(
             slots
@@ -2048,7 +1810,7 @@ mod tests {
         assert!(slots[0].as_ref().unwrap().review_ready);
 
         let p1_idle = json!({"pane_id":"p1","name":"codex","agent_status":"idle"});
-        rebuild_slots_in_live_order(&mut slots, &[&p1_idle, &p2]);
+        rebuild_slots_in_live_order(&mut slots, &[&p1_idle, &p2], AgentOrderMode::Grouped);
 
         assert_eq!(
             slots
@@ -2067,7 +1829,7 @@ mod tests {
         let path = socket_path("reconcile");
         let listener = UnixListener::bind(&path).unwrap();
         let server = thread::spawn(move || {
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = String::new();
                 BufReader::new(stream.try_clone().unwrap())
@@ -2075,6 +1837,9 @@ mod tests {
                     .unwrap();
                 let request: Value = serde_json::from_str(&request).unwrap();
                 let response = match request.get("method").and_then(Value::as_str) {
+                    Some("agent.order.get") => {
+                        json!({"id":"r","result":{"type":"agent_order","order":"grouped"}})
+                    }
                     Some("agent.list") => json!({"id":"r","result":{"agents":[
                         {"pane_id":"live","name":"codex","agent_status":"working"},
                         {"pane_id":"stale","name":"codex","agent_status":"done"}
@@ -2089,7 +1854,12 @@ mod tests {
             }
         });
         let mut slots = [Some(slot("old", "done")), None, None, None, None, None];
-        let state = reconcile(&path, &mut slots).unwrap();
+        let state = reconcile(
+            &path,
+            &mut slots,
+            &OrderSettings::from_env(OrderSelection::Auto, &path, true),
+        )
+        .unwrap();
         assert_eq!(
             state.agent_panes,
             BTreeSet::from(["detected".to_string(), "live".to_string()])
@@ -2111,7 +1881,7 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let server = thread::spawn(move || {
             let mut agent_list_calls = 0;
-            for _ in 0..4 {
+            for _ in 0..6 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = String::new();
                 BufReader::new(stream.try_clone().unwrap())
@@ -2119,18 +1889,19 @@ mod tests {
                     .unwrap();
                 let request: Value = serde_json::from_str(&request).unwrap();
                 let response = match request.get("method").and_then(Value::as_str) {
-                    Some("agent.list") => {
-                        let agents = if agent_list_calls == 0 {
-                            json!([
-                                {"pane_id":"p1","name":"codex","agent_status":"idle"},
-                                {"pane_id":"p2","name":"codex","agent_status":"working"}
-                            ])
+                    Some("agent.order.get") => {
+                        let order = if agent_list_calls == 0 {
+                            "grouped"
                         } else {
-                            json!([
-                                {"pane_id":"p2","name":"codex","agent_status":"working"},
-                                {"pane_id":"p1","name":"codex","agent_status":"idle"}
-                            ])
+                            "priority"
                         };
+                        json!({"id":"r","result":{"type":"agent_order","order":order}})
+                    }
+                    Some("agent.list") => {
+                        let agents = json!([
+                            {"pane_id":"p1","name":"codex","agent_status":"idle","state_change_seq":1},
+                            {"pane_id":"p2","name":"codex","agent_status":"blocked","state_change_seq":2}
+                        ]);
                         agent_list_calls += 1;
                         json!({"id":"r","result":{"agents":agents}})
                     }
@@ -2145,9 +1916,19 @@ mod tests {
         });
         let mut slots: [Option<Slot>; SLOTS] = Default::default();
 
-        reconcile(&path, &mut slots).unwrap();
+        reconcile(
+            &path,
+            &mut slots,
+            &OrderSettings::from_env(OrderSelection::Auto, &path, true),
+        )
+        .unwrap();
         slots[0].as_mut().unwrap().review_ready = true;
-        reconcile(&path, &mut slots).unwrap();
+        reconcile(
+            &path,
+            &mut slots,
+            &OrderSettings::from_env(OrderSelection::Auto, &path, true),
+        )
+        .unwrap();
 
         assert_eq!(
             slots
@@ -2160,6 +1941,135 @@ mod tests {
         assert!(slots[1].as_ref().unwrap().review_ready);
         server.join().unwrap();
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn priority_order_selects_attention_agents_beyond_the_first_six() {
+        let mut slots: [Option<Slot>; SLOTS] = Default::default();
+        let agents: Vec<Value> = (0..6)
+            .map(|index| {
+                json!({
+                    "pane_id": format!("idle-{index}"),
+                    "name": "codex",
+                    "agent_status": "idle",
+                    "state_change_seq": index,
+                })
+            })
+            .chain([
+                json!({"pane_id":"working-old","name":"codex","agent_status":"working","state_change_seq":7}),
+                json!({"pane_id":"done","name":"codex","agent_status":"done","state_change_seq":8}),
+                json!({"pane_id":"blocked","name":"codex","agent_status":"blocked","state_change_seq":9}),
+                json!({"pane_id":"working-new","name":"codex","agent_status":"working","state_change_seq":10}),
+            ])
+            .collect();
+        let live: Vec<&Value> = agents.iter().collect();
+
+        rebuild_slots_in_live_order(&mut slots, &live, AgentOrderMode::Priority);
+
+        let ids: Vec<_> = slots
+            .iter()
+            .flatten()
+            .map(|slot| slot.pane_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "blocked",
+                "done",
+                "working-new",
+                "working-old",
+                "idle-5",
+                "idle-4",
+            ]
+        );
+    }
+
+    #[test]
+    fn priority_order_keeps_review_latches_separate_from_raw_status() {
+        let mut slots = [
+            Some(slot("finishing", "working")),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        let idle = json!({
+            "pane_id":"idle",
+            "name":"codex",
+            "agent_status":"idle",
+            "state_change_seq":20,
+        });
+        let finishing = json!({
+            "pane_id":"finishing",
+            "name":"codex",
+            "agent_status":"idle",
+            "state_change_seq":10,
+        });
+
+        rebuild_slots_in_live_order(&mut slots, &[&idle, &finishing], AgentOrderMode::Priority);
+
+        assert_eq!(slots[0].as_ref().unwrap().pane_id, "idle");
+        assert_eq!(slots[1].as_ref().unwrap().pane_id, "finishing");
+        assert!(slots[1].as_ref().unwrap().review_ready);
+    }
+
+    #[test]
+    fn priority_order_uses_raw_status_and_keeps_equal_sequences_stable() {
+        let agents = [
+            json!({"pane_id":"unknown","agent_status":"unknown","state_change_seq":u64::MAX}),
+            json!({"pane_id":"idle","agent_status":"idle","state_change_seq":100}),
+            json!({"pane_id":"working-first","agent_status":"working"}),
+            json!({"pane_id":"done","agent_status":"done"}),
+            json!({"pane_id":"blocked","agent_status":"blocked"}),
+            json!({"pane_id":"working-second","agent_status":"working","state_change_seq":0}),
+        ];
+        let mut idle = slot("idle", "idle");
+        idle.review_ready = true;
+        let mut done = slot("done", "done");
+        done.review_ready = false;
+        let mut slots = [Some(idle), Some(done), None, None, None, None];
+        rebuild_slots_in_live_order(
+            &mut slots,
+            &agents.iter().collect::<Vec<_>>(),
+            AgentOrderMode::Priority,
+        );
+        assert_eq!(
+            slots
+                .iter()
+                .flatten()
+                .map(|slot| slot.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "blocked",
+                "done",
+                "working-first",
+                "working-second",
+                "idle",
+                "unknown"
+            ]
+        );
+        assert!(!slots[1].as_ref().unwrap().review_ready);
+        assert!(slots[4].as_ref().unwrap().review_ready);
+    }
+
+    #[test]
+    fn agent_order_parser_accepts_only_typed_supported_modes() {
+        assert_eq!(
+            parse_agent_order(&json!({"result":{"type":"agent_order","order":"grouped"}})).unwrap(),
+            AgentOrderMode::Grouped
+        );
+        assert_eq!(
+            parse_agent_order(&json!({"result":{"type":"agent_order","order":"priority"}}))
+                .unwrap(),
+            AgentOrderMode::Priority
+        );
+        assert!(
+            parse_agent_order(&json!({"result":{"type":"agent_order","order":"future"}})).is_err()
+        );
+        assert!(
+            parse_agent_order(&json!({"result":{"type":"agents","order":"priority"}})).is_err()
+        );
     }
 
     #[test]
