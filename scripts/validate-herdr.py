@@ -105,6 +105,7 @@ def main():
             original_window = None
             if args.gui:
                 original_window = json.loads(subprocess.check_output(["hyprctl", "-j", "activewindow"])).get("address")
+                assert original_window, "GUI verification requires an existing window to focus away to"
                 launch(["ghostty", "--class=" + env["HERDR_MICRO_WINDOW_CLASS"],
                         "--gtk-single-instance=false", "-e", args.herdr], "ghostty.log")
                 def windows():
@@ -139,9 +140,10 @@ def main():
             initial = next(f for f in frames if f.get("cmd") == "lights")
             assert initial["lights"][0]["color"] == 0xffaa00, initial
             checks.append("auto ordering: blocked agent first, amber LED command")
-            if args.gui and original_window:
+            if args.gui:
+                assert original_window != address, "GUI verification requires a different original window"
                 subprocess.run(["hyprctl", "dispatch", f'hl.dsp.focus({{ window = "address:{original_window}" }})'], check=True, stdout=subprocess.DEVNULL)
-                eventually(lambda: json.loads(subprocess.check_output(["hyprctl", "-j", "activewindow"])).get("address") != address, "focus moved away before pad event")
+                eventually(lambda: json.loads(subprocess.check_output(["hyprctl", "-j", "activewindow"])).get("address") == original_window, "focus moved away before pad event")
             focus_key("AG00", p2)
             if args.gui:
                 eventually(lambda: json.loads(subprocess.check_output(["hyprctl", "-j", "activewindow"])).get("address") == address, "real compositor focus")
@@ -168,8 +170,14 @@ def main():
             eventually(proof.exists, "dedicated Enter key")
             checks.append("ACT12 executes only in the isolated test shell")
             # Removing an agent must clear its key within a reconciliation.
+            before_release = next(f for f in reversed(frames) if f.get("cmd") == "lights")
+            assert all(light["effect"] != "off" for light in before_release["lights"][:4]), before_release
+            frame_count = len(frames)
             api("pane.release_agent", {"pane_id": p3, "source": "micro-validation", "agent": "codex"})
-            eventually(lambda: next((f for f in reversed(frames) if f.get("cmd") == "lights"), {}).get("lights", [{}] * 4)[3].get("effect") == "off", "closed agent LED")
+            def released_frame():
+                latest = next((f for f in reversed(frames[frame_count:]) if f.get("cmd") == "lights"), None)
+                return latest and all(light["effect"] != "off" for light in latest["lights"][:3]) and latest["lights"][3]["effect"] == "off"
+            eventually(released_frame, "new three-agent LED frame after release")
             checks.append("released agent removed from LED slots")
             assert bridge.poll() is None, "bridge exited during controls"
             time.sleep(0.3)
