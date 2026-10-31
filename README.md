@@ -204,6 +204,8 @@ prints nothing, reconnect the pad and try again. Avoid `chmod` on
 `/dev/hidraw*`: device nodes are recreated on every reconnect, and a broad rule
 would expose unrelated keyboards and security devices.
 
+Herdr and the Xeneon T3 controller share `$XDG_RUNTIME_DIR/microd-controller/ownership.lock` (or `~/.cache/microd-controller/ownership.lock` without a runtime directory). The controller directory survives daemon restarts and does not depend on the socket path. Stop both controllers when upgrading an older adjacent-lock installation and update both consumers before restarting either.
+
 Build and install the binaries and user units without `sudo`:
 
 ```bash

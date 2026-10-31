@@ -121,7 +121,8 @@ def main():
                 env["PATH"] = str(stub) + os.pathsep + env["PATH"]
                 env["WAYLAND_DISPLAY"] = "wayland-micro"
 
-            bridge = launch([bridge_bin, "--socket", str(api_path), "--hub", str(hub_path), "--order", "auto"], "bridge.log")
+            bridge_env = {**env, "MICROD_CONTROLLER_DIR": str(root / "controller")}
+            bridge = launch([bridge_bin, "--socket", str(api_path), "--hub", str(hub_path), "--order", "auto"], "bridge.log", proc_env=bridge_env)
             connection, _ = hub.accept()
             connection.settimeout(None)
 

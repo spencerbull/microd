@@ -18,6 +18,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::Command;
 
+mod ownership;
 mod window;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -326,6 +327,7 @@ fn main() -> Result<()> {
     let herdr_socket = cli.socket.unwrap_or_else(default_herdr_socket);
     let order = OrderSettings::from_env(cli.order, &herdr_socket, api_socket_override);
     let hub_socket = cli.hub.unwrap_or_else(default_hub_socket);
+    let _controller_owner = ownership::acquire(&hub_socket)?;
 
     // microd connection: reader thread decodes pad events; the write half
     // (shared) carries LED commands. Wait for both sockets instead of
