@@ -10,7 +10,10 @@ pub fn acquire(_hub: &Path) -> Result<File> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .context("Micro ownership requires XDG_RUNTIME_DIR or HOME")?;
-    acquire_lock(root.join("microd-controller/ownership.lock"))
+    let directory = std::env::var_os("MICROD_CONTROLLER_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("microd-controller"));
+    acquire_lock(directory.join("ownership.lock"))
 }
 
 fn acquire_lock(lock: PathBuf) -> Result<File> {
@@ -64,6 +67,7 @@ mod tests {
         let probe = |path: &Path, blocked: bool| {
             assert!(Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "ownership::tests::ownership_probe"])
+                .env_remove("MICROD_CONTROLLER_DIR")
                 .env("XDG_RUNTIME_DIR", &directory)
                 .env("MICROD_TEST_OWNERSHIP_HUB", path)
                 .env("MICROD_TEST_OWNERSHIP_BLOCKED", blocked.to_string())
@@ -78,6 +82,19 @@ mod tests {
             probe(&alias, true);
             std::fs::remove_dir_all(&daemon_directory).unwrap();
             std::fs::create_dir(&daemon_directory).unwrap();
+            probe(&alias, true);
+            assert!(Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "ownership::tests::ownership_probe"])
+                .env("XDG_RUNTIME_DIR", &directory)
+                .env(
+                    "MICROD_CONTROLLER_DIR",
+                    directory.join("synthetic-controller")
+                )
+                .env("MICROD_TEST_OWNERSHIP_HUB", &alias)
+                .env("MICROD_TEST_OWNERSHIP_BLOCKED", "false")
+                .status()
+                .unwrap()
+                .success());
             probe(&alias, true);
             #[cfg(target_os = "linux")]
             assert!(!Command::new("flock")
