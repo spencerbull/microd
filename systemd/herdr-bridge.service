@@ -20,6 +20,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
+ReadWritePaths=%t/microd
 RestrictAddressFamilies=AF_UNIX
 LockPersonality=yes
 RestrictSUIDSGID=yes
