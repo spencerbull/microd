@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Herdr Micro
+Comment=Herdr terminal with Codex Micro navigation
+Exec=herdr-micro
+Icon=utilities-terminal
+Type=Application
+Terminal=false
+Categories=Development;TerminalEmulator;
